@@ -62,6 +62,12 @@ local function startSession(source, name)
         name = name,
         joinedAt = os.time(),
         pendingEvents = {},
+        activity = {
+            stationarySeconds = 0,
+            pendingAfkSeconds = 0,
+            reportSequence = 0,
+            reportNonce = eventKey(source),
+        },
     }
 
     apiPost('/api/ingest/session/start', {
@@ -197,11 +203,83 @@ local function observeMoneyChanges(source, session)
 end
 
 -- ---------------------------------------------------------------------------
+-- AFK accounting
+-- ---------------------------------------------------------------------------
+
+local function playerPosition(source)
+    local okPed, ped = pcall(GetPlayerPed, source)
+    if not okPed or not ped or ped <= 0 then return nil end
+    local okCoords, coords = pcall(GetEntityCoords, ped)
+    if not okCoords or not coords or type(coords.x) ~= 'number' or type(coords.y) ~= 'number' or type(coords.z) ~= 'number' then return nil end
+    return { x = coords.x, y = coords.y, z = coords.z }
+end
+
+local function flushAfkTime(source, session)
+    local activity = session.activity
+    if activity.reportInFlight or activity.pendingAfkSeconds <= 0 then return end
+
+    local seconds = math.min(900, activity.pendingAfkSeconds)
+    local key = ('afk-%s-%d'):format(activity.reportNonce, activity.reportSequence)
+    activity.reportInFlight = true
+    -- Keep the same key until a successful response. If the response is lost,
+    -- the API's idempotency ledger safely treats this retry as already applied.
+    apiPost('/api/ingest/activity', {
+        license = session.identifiers.license,
+        afkSeconds = seconds,
+        idempotencyKey = key,
+    }, function(statusCode)
+        activity.reportInFlight = false
+        if statusCode == 200 or statusCode == 201 then
+            activity.pendingAfkSeconds = math.max(0, activity.pendingAfkSeconds - seconds)
+            activity.reportSequence = activity.reportSequence + 1
+        end
+    end)
+end
+
+local function observeAfkTime(source, session, observedAt)
+    local position = playerPosition(source)
+    if not position then return end
+
+    local activity = session.activity
+    if not activity.lastObservedAt or not activity.lastPosition then
+        activity.lastObservedAt = observedAt
+        activity.lastPosition = position
+        return
+    end
+
+    local elapsed = observedAt - activity.lastObservedAt
+    local previous = activity.lastPosition
+    activity.lastObservedAt = observedAt
+    activity.lastPosition = position
+    if elapsed <= 0 or elapsed > Config.AfkMaxSampleGapSec then
+        activity.stationarySeconds = 0
+        return
+    end
+
+    local dx = position.x - previous.x
+    local dy = position.y - previous.y
+    local dz = position.z - previous.z
+    local toleranceSquared = Config.AfkMovementTolerance * Config.AfkMovementTolerance
+    if dx * dx + dy * dy + dz * dz > toleranceSquared then
+        activity.stationarySeconds = 0
+        return
+    end
+
+    local before = activity.stationarySeconds
+    activity.stationarySeconds = before + elapsed
+    local newlyAfk = math.max(0, activity.stationarySeconds - Config.AfkThresholdSec)
+        - math.max(0, before - Config.AfkThresholdSec)
+    if newlyAfk > 0 then activity.pendingAfkSeconds = activity.pendingAfkSeconds + newlyAfk end
+    flushAfkTime(source, session)
+end
+
+-- ---------------------------------------------------------------------------
 -- Heartbeat: keeps server.last_seen_at fresh and reports live player count
 -- ---------------------------------------------------------------------------
 
 local function heartbeat()
     local players = {}
+    local observedAt = os.time()
     -- Use the authoritative player list rather than just our memory. This
     -- recovers sessions when the resource is started or restarted while users
     -- are already connected.
@@ -209,6 +287,7 @@ local function heartbeat()
         local source = tonumber(playerSource)
         local session = source and (openSessions[source] or startSession(source, GetPlayerName(source) or ('Player ' .. playerSource)))
         if session then
+            observeAfkTime(source, session, observedAt)
             players[#players + 1] = { license = session.identifiers.license, playerInfo = Framework.GetPlayerInfo(source) }
             observeMoneyChanges(source, session)
         end

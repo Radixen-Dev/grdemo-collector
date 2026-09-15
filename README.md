@@ -22,3 +22,17 @@ to GuildRate Analytics.
    ```
 
 The collector detects ESX, QBCore, QBox, or vanilla FiveM automatically.
+
+## AFK accounting
+
+During its existing 60-second heartbeat, the collector samples each player's
+server-visible position once. It considers a player AFK after they remain
+within `Config.AfkMovementTolerance` for `Config.AfkThresholdSec` (defaults:
+1.5 metres for five minutes). Only newly accrued AFK seconds and an
+idempotency key are sent to Analytics—coordinates, paths, and raw movement
+samples are never transmitted or retained.
+
+This is deliberately server-side and O(players) per heartbeat, not a client
+script or a per-frame loop. It requires a OneSync-capable server for
+server-visible player coordinates; when coordinates are unavailable, the
+collector simply does not classify the interval as AFK.
