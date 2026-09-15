@@ -12,6 +12,14 @@ Config.ApiKey = GetConvar('guildrate_api_key', '')
 -- current player count even with no join/leave activity).
 Config.HeartbeatIntervalSec = 60
 
+-- AFK is calculated server-side during the existing heartbeat, so no client
+-- script, position history, or per-frame polling is needed. A player becomes
+-- AFK after remaining within this radius for AfkThresholdSec.
+Config.AfkThresholdSec = 300
+Config.AfkMovementTolerance = 1.5
+-- Do not classify time after a stalled heartbeat; wait for a fresh sample.
+Config.AfkMaxSampleGapSec = 120
+
 -- Which built-in framework events to translate into analytics events.
 -- Set to false to only collect join/leave sessions, no framework payloads.
 Config.CollectFrameworkEvents = true
