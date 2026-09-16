@@ -3,6 +3,7 @@
 
 local openSessions = {} -- [source] = { identifiers = {...}, joinedAt = os.time() }
 local emitEvent -- forward declaration: session-start callbacks flush queued events
+local insecureUrlWarningLogged = false
 
 local function eventKey(source)
     return ('%s-%s-%s-%s'):format(os.time(), GetGameTimer(), source or 0, math.random(100000, 999999))
@@ -19,13 +20,31 @@ local function apiPost(path, body, cb)
     -- Cloudflare custom-domain routing rejects before the Worker can handle it.
     local apiBaseUrl = Config.ApiUrl:gsub('/+$', '')
 
+    -- Local development is allowed to use HTTP, but production telemetry and
+    -- the API key must never be sent to a remote clear-text endpoint.
+    local scheme = apiBaseUrl:match('^(https?)://')
+    local loopback = apiBaseUrl:match('^http://localhost[:/]')
+        or apiBaseUrl:match('^http://127%.0%.0%.1[:/]')
+        or apiBaseUrl:match('^http://%[::1%][:/]')
+        or apiBaseUrl:match('^http://::1[:/]')
+    if scheme ~= 'https' and not loopback then
+        if not insecureUrlWarningLogged then
+            print('[guildrate-collector] refusing non-HTTPS remote API URL; set guildrate_api_url to an https:// endpoint')
+            insecureUrlWarningLogged = true
+        end
+        return
+    end
+
     PerformHttpRequest(apiBaseUrl .. path, function(statusCode, response, headers, errorData)
         if statusCode ~= 200 and statusCode ~= 201 then
-            print(('[guildrate-collector] %s -> HTTP %s: %s%s'):format(
+            local detail = tostring(errorData or ''):gsub('[\r\n]', ' ')
+            if #detail > 160 then detail = detail:sub(1, 160) .. '…' end
+            local escapedKey = Config.ApiKey:gsub('([%^%$%(%)%%%.%[%]%*%+%-%?])', '%%%1')
+            detail = detail:gsub(escapedKey, '[redacted]')
+            print(('[guildrate-collector] %s -> HTTP %s%s'):format(
                 path,
                 tostring(statusCode),
-                tostring(response),
-                errorData and (' (' .. tostring(errorData) .. ')') or ''
+                detail ~= '' and (' (' .. detail .. ')') or ''
             ))
         end
         if cb then cb(statusCode, response) end
@@ -39,7 +58,9 @@ local function getIdentifiers(source)
     local ids = {}
     for _, id in ipairs(GetPlayerIdentifiers(source)) do
         local kind = id:match('^(%a+):')
-        if kind then ids[kind] = id end
+        -- The license is the sole stable identifier needed by Analytics.
+        -- Do not forward Discord, Steam, IP, or other platform identifiers.
+        if kind == 'license' and id:match('^license:[%x]+$') then ids.license = id end
     end
     return ids
 end
@@ -108,7 +129,6 @@ AddEventHandler('playerDropped', function(reason)
     apiPost('/api/ingest/session/end', {
         sessionId = session.sessionId,
         license = session.identifiers.license,
-        reason = reason,
     })
 
     openSessions[source] = nil
@@ -149,7 +169,49 @@ emitEvent = function(source, eventType, payload)
     end
 
     payload = payload or {}
-    payload.playerInfo = Framework.GetPlayerInfo(source)
+
+    -- Framework adapters return an intentionally small, analytics-oriented
+    -- shape. Event payloads are also allowlisted here so a framework update
+    -- cannot accidentally cause arbitrary metadata or identifiers to leak.
+    local safePayload = {}
+    local function safeText(value, maxLength)
+        if type(value) ~= 'string' then return nil end
+        value = value:gsub('[%z\r\n]', ' ')
+        return #value > maxLength and value:sub(1, maxLength) or value
+    end
+    local function safeJob(value)
+        if type(value) ~= 'table' then return nil end
+        return {
+            name = safeText(value.name, 128),
+            label = safeText(value.label, 128),
+            grade = type(value.grade) == 'number' and value.grade or nil,
+            onDuty = type(value.onDuty) == 'boolean' and value.onDuty or nil,
+        }
+    end
+    if eventType == 'player_death' then
+        safePayload.weaponHash = type(payload.weaponHash) == 'number' and payload.weaponHash or nil
+        safePayload.killerType = type(payload.killerType) == 'number' and payload.killerType or nil
+    elseif eventType == 'job_change' then
+        safePayload.job = safeJob(payload.job)
+        safePayload.previousJob = safeText(payload.previousJob, 128)
+    elseif eventType == 'job2_change' then
+        safePayload.job2 = safeJob(payload.job2)
+        safePayload.previousJob2 = safeText(payload.previousJob2, 128)
+    elseif eventType == 'gang_change' then
+        safePayload.gang = safeJob(payload.gang)
+    elseif eventType == 'group_change' then
+        safePayload.group = safeText(payload.group, 128)
+    elseif eventType == 'money_change' then
+        for _, key in ipairs({ 'moneyType', 'account', 'operation' }) do
+            safePayload[key] = safeText(payload[key], 128)
+        end
+        for _, key in ipairs({ 'amount', 'balance', 'previousAmount' }) do
+            if type(payload[key]) == 'number' then safePayload[key] = payload[key] end
+        end
+        if payload.observedByHeartbeat == true then safePayload.observedByHeartbeat = true end
+    end
+    safePayload.playerInfo = Framework.GetPlayerInfo(source)
+    payload = safePayload
 
     -- Keep the heartbeat fallback in sync with framework-originated money
     -- events so one balance change is not reported twice.
@@ -157,11 +219,9 @@ emitEvent = function(source, eventType, payload)
         session.moneySnapshot = copyMoney(payload.playerInfo.money)
     end
 
+    -- Events stay attributable to their actor, but do not transmit other
+    -- players' identifiers or create relationship graphs from game events.
     local participants = { { role = 'actor', license = session.identifiers.license } }
-    if payload.targetLicense then table.insert(participants, { role = 'target', license = payload.targetLicense }) end
-    if payload.victimLicense then table.insert(participants, { role = 'victim', license = payload.victimLicense }) end
-    if payload.recipientLicense then table.insert(participants, { role = 'recipient', license = payload.recipientLicense }) end
-    if payload.killerLicense then table.insert(participants, { role = 'killer', license = payload.killerLicense }) end
 
     apiPost('/api/ingest/event', {
         license = session.identifiers.license,

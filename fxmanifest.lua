@@ -4,7 +4,7 @@ game 'gta5'
 name 'guildrate-collector'
 author 'GuildRate'
 description 'Drop-in analytics collector: reports sessions, players and framework events to the GuildRate dashboard'
-version '0.1.1'
+version '0.1.2'
 
 shared_scripts {
     'config.lua'

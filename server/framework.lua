@@ -2,10 +2,9 @@
 -- uniform adapter so collector.lua never has to know whether it's talking to
 -- ESX, QBCore/QBox, or nothing at all.
 --
--- getPlayerInfo deliberately just forwards whatever the framework already
--- tracks (job, money, gang, character metadata, ...) instead of reinventing
--- it — these frameworks maintain a rich player state object for their own
--- purposes; we're just reading it, not duplicating the bookkeeping.
+-- getPlayerInfo returns only the small analytics projection needed by the
+-- dashboard. Character IDs, names, platform identifiers, and arbitrary
+-- framework metadata are deliberately excluded.
 --
 -- Add a new framework by implementing the same shape (detect / init /
 -- getPlayerInfo / registerEvents) and registering it in `Adapters` below.
@@ -13,14 +12,6 @@
 Framework = {}
 
 local Adapters = {}
-
-local function licenseForSource(playerSource)
-    if not playerSource then return nil end
-    for _, identifier in ipairs(GetPlayerIdentifiers(playerSource)) do
-        if identifier:sub(1, 8) == 'license:' then return identifier end
-    end
-    return nil
-end
 
 -- ---------------------------------------------------------------------------
 -- ESX (tested against es_extended "legacy")
@@ -37,7 +28,6 @@ Adapters.esx = {
         if not xPlayer then return nil end
 
         local info = {
-            identifier = xPlayer.identifier,
             job = xPlayer.job and { name = xPlayer.job.name, label = xPlayer.job.label, grade = xPlayer.job.grade },
             job2 = xPlayer.job2 and { name = xPlayer.job2.name, label = xPlayer.job2.label, grade = xPlayer.job2.grade },
             group = xPlayer.group,
@@ -106,19 +96,13 @@ local QBCoreAdapter = {
         local data = Player.PlayerData
 
         return {
-            citizenid = data.citizenid, -- the actual per-character id; `license` (used elsewhere) is per Rockstar account
-            charinfo = data.charinfo and {
-                firstname = data.charinfo.firstname,
-                lastname = data.charinfo.lastname,
-            },
             job = data.job and { name = data.job.name, label = data.job.label, grade = data.job.grade, onDuty = data.job.onduty },
             gang = data.gang and { name = data.gang.name, label = data.gang.label, grade = data.gang.grade },
-            money = data.money, -- { cash, bank, crypto } as tracked by QBCore itself
-
-            -- Shape varies by QBCore fork (health/hunger/thirst/stress/isdead
-            -- etc aren't all guaranteed keys) so it's passed through as-is
-            -- rather than cherry-picked — jsonb doesn't care about the shape.
-            metadata = data.metadata,
+            money = data.money and {
+                cash = type(data.money.cash) == 'number' and data.money.cash or nil,
+                bank = type(data.money.bank) == 'number' and data.money.bank or nil,
+                crypto = type(data.money.crypto) == 'number' and data.money.crypto or nil,
+            },
         }
     end,
     registerEvents = function(self, emit)
@@ -137,7 +121,7 @@ local QBCoreAdapter = {
         end)
         AddEventHandler('QBCore:Server:PlayerLoaded', function(Player)
             local source = Player and Player.PlayerData and Player.PlayerData.source
-            if source then emit(source, 'character_loaded', { citizenid = Player.PlayerData.citizenid }) end
+            if source then emit(source, 'character_loaded', {}) end
         end)
         AddEventHandler('QBCore:Server:PlayerUnload', function(source)
             emit(source, 'character_unloaded', {})
@@ -158,13 +142,10 @@ local QBCoreAdapter = {
         AddEventHandler('baseevents:onPlayerDied', function()
             emit(source, 'player_death', {})
         end)
-        -- baseevents supplies the victim through the server-event context and
-        -- the killer as its first argument. Capture both sides when available
-        -- so Player 360° and Event Investigator can trace an interaction from
-        -- either participant, rather than treating every death as actor-only.
-        AddEventHandler('baseevents:onPlayerKilled', function(killerSource, deathData)
+        -- Do not associate one player's activity with another player's
+        -- identifier. The event remains attributable to its actor only.
+        AddEventHandler('baseevents:onPlayerKilled', function(_killerSource, deathData)
             emit(source, 'player_death', {
-                killerLicense = licenseForSource(killerSource),
                 weaponHash = deathData and deathData.weaponhash,
                 killerType = deathData and deathData.killerType,
             })

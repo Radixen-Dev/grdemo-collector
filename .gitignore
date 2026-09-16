@@ -1,0 +1,11 @@
+# Local FiveM secrets and operational output (keep this resource portable).
+server.cfg
+.env
+.env.*
+*.log
+logs/
+dumps/
+*.dump
+*.sql
+*.key
+*.pem
