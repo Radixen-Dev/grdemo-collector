@@ -26,6 +26,18 @@ end
 -- ESX (tested against es_extended "legacy")
 -- ---------------------------------------------------------------------------
 Adapters.esx = {
+    capabilities = {
+        'character.state',
+    },
+    eventCapabilities = {
+        player_death = 'combat.death',
+        money_change = 'economy.transaction',
+        job_change = 'role.job',
+        job2_change = 'role.job',
+    },
+    deathEventAvailable = function()
+        return true
+    },
     detect = function()
         return GetResourceState('es_extended') == 'started'
     end,
@@ -94,6 +106,21 @@ Adapters.esx = {
 -- QBCore / QBox (share the same event names and PlayerData shape)
 -- ---------------------------------------------------------------------------
 local QBCoreAdapter = {
+    capabilities = {
+        'character.state',
+        'economy.balance',
+    },
+    eventCapabilities = {
+        player_death = 'combat.death',
+        money_change = 'economy.transaction',
+        job_change = 'role.job',
+        gang_change = 'role.gang',
+    },
+    deathEventAvailable = function()
+        return GetResourceState('qb-ambulancejob') == 'started'
+            or GetResourceState('qbx-medical') == 'started'
+            or GetResourceState('baseevents') == 'started'
+    },
     detect = function()
         return GetResourceState('qb-core') == 'started'
     end,
@@ -182,6 +209,9 @@ Adapters.qbox = {
     init = QBCoreAdapter.init,
     getPlayerInfo = QBCoreAdapter.getPlayerInfo,
     registerEvents = QBCoreAdapter.registerEvents,
+    capabilities = QBCoreAdapter.capabilities,
+    eventCapabilities = QBCoreAdapter.eventCapabilities,
+    deathEventAvailable = QBCoreAdapter.deathEventAvailable,
 }
 Adapters.qbcore = QBCoreAdapter
 
@@ -189,6 +219,8 @@ Adapters.qbcore = QBCoreAdapter
 -- Fallback: no framework, vanilla natives only
 -- ---------------------------------------------------------------------------
 Adapters.vanilla = {
+    capabilities = {},
+    eventCapabilities = {},
     detect = function() return true end,
     init = function() end,
     getPlayerInfo = function() return {} end,
@@ -231,6 +263,32 @@ function Framework.GetPlayerInfo(source)
     local ok, result = pcall(function() return active:getPlayerInfo(source) end)
     if ok then return result or {} end
     return {}
+end
+
+function Framework.GetCapabilities()
+    local capabilities = {
+        'session.lifecycle',
+        'population.heartbeat',
+        'activity.afk_aggregate',
+        'identity.identifiers',
+    }
+    for _, capability in ipairs(active.capabilities or {}) do
+        capabilities[#capabilities + 1] = capability
+    end
+    if Config.CollectFrameworkEvents then
+        local seen = {}
+        for _, eventType in ipairs(Config.TrackedEvents or {}) do
+            local capability = active.eventCapabilities and active.eventCapabilities[eventType]
+            local deathUnavailable = capability == 'combat.death'
+                and active.deathEventAvailable
+                and not active:deathEventAvailable()
+            if capability and not deathUnavailable and not seen[capability] then
+                capabilities[#capabilities + 1] = capability
+                seen[capability] = true
+            end
+        end
+    end
+    return capabilities
 end
 
 function Framework.RegisterEvents(emit)

@@ -23,6 +23,17 @@ to GuildRate Analytics.
 
 The collector detects ESX, QBCore, QBox, or vanilla FiveM automatically.
 
+## Collection coverage
+
+Each heartbeat reports the collector version, active framework, and only the
+capabilities enabled by this server's current configuration. Optional event
+sources are reported only when their resource is running. The dashboard uses
+this to show which operational signals are covered. This metadata contains no
+player data and does not enable automated moderation actions.
+
+The capability manifest is covered by a standalone Lua test. Run it with
+`lua test/framework_capabilities.lua` on a machine with Lua 5.4 installed.
+
 ## AFK accounting
 
 During its existing 60-second heartbeat, the collector samples each player's
