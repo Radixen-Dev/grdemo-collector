@@ -43,7 +43,7 @@ local function loadCollector(enabled, invokingResource, deferCallbacks)
     AddEventHandler = function(name, handler) handlers[name] = handler end
     RegisterNetEvent = function() registerNetEventCalls = registerNetEventCalls + 1 end
     GetInvokingResource = function() return invokingResource end
-    GetPlayerIdentifiers = function() return { 'license:test-player', 'discord:123' } end
+    GetPlayerIdentifiers = function() return { 'license:abcdef0123456789', 'discord:123' } end
     GetPlayerName = function() return 'Test Player' end
     GetGameTimer = function() return 10 end
     GetPlayers = function() return {} end

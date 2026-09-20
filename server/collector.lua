@@ -242,6 +242,14 @@ emitEvent = function(source, eventType, payload)
             if type(payload[key]) == 'number' then safePayload[key] = payload[key] end
         end
         if payload.observedByHeartbeat == true then safePayload.observedByHeartbeat = true end
+    elseif eventType == 'conduct_action' then
+        -- The server-only adapter has already bounded and detached context
+        -- before it reaches emitEvent. Copy it again through the same
+        -- allowlist so this projection cannot accidentally retain arbitrary
+        -- data if another internal producer is added later.
+        safePayload = copyConductContext(payload, 0, { fields = 64, bytes = 8192 }, {})
+        safePayload.action = payload.action
+        safePayload.sourceResource = payload.sourceResource
     end
     safePayload.playerInfo = Framework.GetPlayerInfo(source)
     payload = safePayload
