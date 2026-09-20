@@ -7,6 +7,12 @@ local function assertEqual(actual, expected, message)
     assert(actual == expected, (message or 'unexpected value') .. ': expected ' .. tostring(expected) .. ', got ' .. tostring(actual))
 end
 
+local function countEntries(values)
+    local count = 0
+    for _ in pairs(values) do count = count + 1 end
+    return count
+end
+
 local function loadCollector(enabled, invokingResource, deferCallbacks)
     local handlers = {}
     local requests = {}
@@ -110,5 +116,15 @@ assertEqual(#requests, 2, 'queued observation should flush after acknowledgement
 assertEqual(requests[2].body.payload.action, 'warn', 'queued action must remain collector-derived')
 assertEqual(requests[2].body.payload.sourceResource, 'staff-resource', 'queued source must remain collector-derived')
 assertEqual(requests[2].body.payload.note, 'original', 'queued context must be detached from the caller')
+
+-- Context is bounded across the entire traversal: a nested table cannot turn
+-- a modest root limit into an exponentially larger queued or HTTP payload.
+report, requests = loadCollector(true, 'staff-resource')
+context = { nested = {}, oversized = string.rep('x', 1025) }
+for index = 1, 80 do context.nested['field' .. index] = 'x' end
+report(42, 'warn', context)
+local boundedPayload = requests[2].body.payload
+assertEqual(boundedPayload.oversized, nil, 'oversized scalar context must be discarded')
+assertEqual(countEntries(boundedPayload.nested), 63, 'nested entries must share the global field budget')
 
 print('conduct adapter tests passed')
