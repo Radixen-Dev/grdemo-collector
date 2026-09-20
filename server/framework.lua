@@ -37,7 +37,7 @@ Adapters.esx = {
     },
     deathEventAvailable = function()
         return true
-    },
+    end,
     detect = function()
         return GetResourceState('es_extended') == 'started'
     end,
