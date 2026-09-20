@@ -120,7 +120,7 @@ local QBCoreAdapter = {
         return GetResourceState('qb-ambulancejob') == 'started'
             or GetResourceState('qbx-medical') == 'started'
             or GetResourceState('baseevents') == 'started'
-    },
+    end,
     detect = function()
         return GetResourceState('qb-core') == 'started'
     end,
