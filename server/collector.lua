@@ -122,6 +122,7 @@ local trackedEventSet = {}
 for _, eventType in ipairs(Config.TrackedEvents) do
     trackedEventSet[eventType] = true
 end
+if Config.CollectConductActions then trackedEventSet.conduct_action = true end
 
 local function copyMoney(money)
     local snapshot = {}
@@ -173,6 +174,24 @@ emitEvent = function(source, eventType, payload)
         participants = participants,
     })
 end
+
+-- This intentionally uses AddEventHandler, not RegisterNetEvent: only code
+-- running on the server can report a conduct action. The collector is an
+-- observation sink, never an authority that performs the action itself.
+AddEventHandler('guildrate:conductAction', function(targetSource, action, context)
+    if not Config.CollectConductActions then return end
+    if GetInvokingResource() == nil then
+        print('[guildrate-collector] ignored conduct action without a server resource caller')
+        return
+    end
+    if type(targetSource) ~= 'number' or type(action) ~= 'string' then return end
+    local normalizedAction = action:lower()
+    if normalizedAction ~= 'warn' and normalizedAction ~= 'kick' and normalizedAction ~= 'ban' then return end
+    local payload = type(context) == 'table' and context or {}
+    payload.action = normalizedAction
+    payload.sourceResource = GetInvokingResource()
+    emitEvent(targetSource, 'conduct_action', payload)
+end)
 
 local function observeMoneyChanges(source, session)
     local playerInfo = Framework.GetPlayerInfo(source)
