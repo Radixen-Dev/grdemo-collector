@@ -142,6 +142,7 @@ local trackedEventSet = {}
 for _, eventType in ipairs(Config.TrackedEvents) do
     trackedEventSet[eventType] = true
 end
+if Config.CollectConductActions then trackedEventSet.conduct_action = true end
 
 local function copyMoney(money)
     local snapshot = {}
@@ -149,6 +150,38 @@ local function copyMoney(money)
         if type(amount) == 'number' then snapshot[moneyType] = amount end
     end
     return snapshot
+end
+
+-- Context comes from another resource. Detach it before a session-start
+-- callback can queue it, so that resource cannot alter collector-owned fields
+-- (or the recorded context) after TriggerEvent has returned.
+local function copyConductContext(context, depth, limits, seen)
+    if type(context) ~= 'table' then return {} end
+    if depth >= 3 or seen[context] then return {} end
+
+    seen[context] = true
+    local copied = {}
+    for key, value in pairs(context) do
+        if limits.fields <= 0 or limits.bytes <= 0 then break end
+        if type(key) == 'string' and #key <= 128 and key ~= 'action' and key ~= 'sourceResource' then
+            local valueType = type(value)
+            local scalarValue = valueType == 'string' or valueType == 'number' or valueType == 'boolean'
+            local valueBytes = scalarValue and #tostring(value) or 0
+            if scalarValue and valueBytes <= 1024 and #key + valueBytes <= limits.bytes then
+                copied[key] = value
+                limits.fields = limits.fields - 1
+                limits.bytes = limits.bytes - #key - valueBytes
+            elseif valueType == 'table' then
+                if #key <= limits.bytes then
+                    limits.fields = limits.fields - 1
+                    limits.bytes = limits.bytes - #key
+                    copied[key] = copyConductContext(value, depth + 1, limits, seen)
+                end
+            end
+        end
+    end
+    seen[context] = nil
+    return copied
 end
 
 emitEvent = function(source, eventType, payload)
@@ -209,6 +242,14 @@ emitEvent = function(source, eventType, payload)
             if type(payload[key]) == 'number' then safePayload[key] = payload[key] end
         end
         if payload.observedByHeartbeat == true then safePayload.observedByHeartbeat = true end
+    elseif eventType == 'conduct_action' then
+        -- The server-only adapter has already bounded and detached context
+        -- before it reaches emitEvent. Copy it again through the same
+        -- allowlist so this projection cannot accidentally retain arbitrary
+        -- data if another internal producer is added later.
+        safePayload = copyConductContext(payload, 0, { fields = 64, bytes = 8192 }, {})
+        safePayload.action = payload.action
+        safePayload.sourceResource = payload.sourceResource
     end
     safePayload.playerInfo = Framework.GetPlayerInfo(source)
     payload = safePayload
@@ -233,6 +274,25 @@ emitEvent = function(source, eventType, payload)
         participants = participants,
     })
 end
+
+-- This intentionally uses AddEventHandler, not RegisterNetEvent: only code
+-- running on the server can report a conduct action. The collector is an
+-- observation sink, never an authority that performs the action itself.
+AddEventHandler('guildrate:conductAction', function(targetSource, action, context)
+    if not Config.CollectConductActions then return end
+    local invokingResource = GetInvokingResource()
+    if invokingResource == nil then
+        print('[guildrate-collector] ignored conduct action without a server resource caller')
+        return
+    end
+    if type(targetSource) ~= 'number' or type(action) ~= 'string' then return end
+    local normalizedAction = action:lower()
+    if normalizedAction ~= 'warn' and normalizedAction ~= 'kick' and normalizedAction ~= 'ban' then return end
+    local payload = copyConductContext(context, 0, { fields = 64, bytes = 8192 }, {})
+    payload.action = normalizedAction
+    payload.sourceResource = invokingResource
+    emitEvent(targetSource, 'conduct_action', payload)
+end)
 
 local function observeMoneyChanges(source, session)
     local playerInfo = Framework.GetPlayerInfo(source)

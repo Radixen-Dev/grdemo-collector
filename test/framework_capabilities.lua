@@ -38,11 +38,16 @@ local generic = {
     'session.lifecycle', 'population.heartbeat', 'activity.afk_aggregate', 'identity.identifiers',
 }
 
-local off = capabilitiesFor({ CollectFrameworkEvents = false, TrackedEvents = { 'money_change' } }, { ['qb-core'] = 'started' })
+local off = capabilitiesFor({ CollectFrameworkEvents = false, CollectConductActions = false, TrackedEvents = { 'money_change' } }, { ['qb-core'] = 'started' })
 assertCapabilities(off, {
     'session.lifecycle', 'population.heartbeat', 'activity.afk_aggregate', 'identity.identifiers',
     'character.state', 'economy.balance',
 }, { 'economy.transaction', 'role.job', 'role.gang', 'combat.death' })
+
+local conductEnabled = capabilitiesFor({ CollectFrameworkEvents = false, CollectConductActions = true, TrackedEvents = {} }, {})
+assertCapabilities(conductEnabled, {
+    'session.lifecycle', 'population.heartbeat', 'activity.afk_aggregate', 'identity.identifiers', 'moderation.audit_import',
+}, {})
 
 local filtered = capabilitiesFor({ CollectFrameworkEvents = true, TrackedEvents = { 'job_change' } }, { qbx_core = 'started', ['qb-core'] = 'started' })
 assertCapabilities(filtered, {

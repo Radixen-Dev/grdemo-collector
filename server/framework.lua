@@ -269,6 +269,9 @@ function Framework.GetCapabilities()
             end
         end
     end
+    if Config.CollectConductActions then
+        capabilities[#capabilities + 1] = 'moderation.audit_import'
+    end
     return capabilities
 end
 
