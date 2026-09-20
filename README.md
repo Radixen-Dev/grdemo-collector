@@ -34,6 +34,21 @@ player data and does not enable automated moderation actions.
 The capability manifest is covered by a standalone Lua test. Run it with
 `lua test/framework_capabilities.lua` on a machine with Lua 5.4 installed.
 
+## Conduct observations (optional)
+
+Set `Config.CollectConductActions = true` only if a server resource already
+makes staff decisions and you want to record those decisions as observations.
+That resource may call the server-only API:
+
+```lua
+TriggerEvent('guildrate:conductAction', targetSource, 'warn', { reason = '...' })
+```
+
+Accepted actions are `warn`, `kick`, and `ban`. The adapter is not networked,
+does not accept client calls, and never performs or recommends a player
+action. It records the calling resource and the target's existing identifier.
+Keep `context` limited to necessary, non-sensitive operational details.
+
 ## AFK accounting
 
 During its existing 60-second heartbeat, the collector samples each player's
