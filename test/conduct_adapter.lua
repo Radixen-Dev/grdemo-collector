@@ -7,10 +7,11 @@ local function assertEqual(actual, expected, message)
     assert(actual == expected, (message or 'unexpected value') .. ': expected ' .. tostring(expected) .. ', got ' .. tostring(actual))
 end
 
-local function loadCollector(enabled, invokingResource)
+local function loadCollector(enabled, invokingResource, deferCallbacks)
     local handlers = {}
     local requests = {}
     local registerNetEventCalls = 0
+    local pendingCallbacks = {}
 
     Config = {
         ApiKey = 'test-key',
@@ -48,11 +49,19 @@ local function loadCollector(enabled, invokingResource)
     print = function() end
     PerformHttpRequest = function(url, callback, method, body, headers)
         requests[#requests + 1] = { url = url, method = method, body = body, headers = headers }
-        callback(201, '{}')
+        if deferCallbacks then
+            pendingCallbacks[#pendingCallbacks + 1] = function() callback(201, '{}') end
+        else
+            callback(201, '{}')
+        end
     end
 
     assert(loadfile(root .. '/server/collector.lua'))()
-    return handlers['guildrate:conductAction'], requests, function() return registerNetEventCalls end
+    return handlers['guildrate:conductAction'], requests, function() return registerNetEventCalls end, function()
+        local callbacks = pendingCallbacks
+        pendingCallbacks = {}
+        for _, callback in ipairs(callbacks) do callback() end
+    end
 end
 
 -- Disabled means the event is a complete no-op even when a server resource emits it.
@@ -73,6 +82,7 @@ assertEqual(#requests, 0, 'unsupported or malformed action must not report')
 
 -- An accepted event records the already-made decision, attributes it to the actual
 -- server resource, and cannot be spoofed through the supplied context table.
+local registerNetEventCalls
 report, requests, registerNetEventCalls = loadCollector(true, 'staff-resource')
 local context = { note = 'reviewed by staff', action = 'ban', sourceResource = 'spoofed-resource' }
 report(42, 'WARN', context)
@@ -83,5 +93,22 @@ assertEqual(requests[2].body.payload.action, 'warn', 'normalized action')
 assertEqual(requests[2].body.payload.sourceResource, 'staff-resource', 'source must come from FiveM')
 assertEqual(requests[2].body.payload.note, 'reviewed by staff', 'safe context should be retained')
 assertEqual(registerNetEventCalls(), 0, 'adapter must never expose a network event')
+
+-- A just-connected player's action is queued until session acknowledgement.
+-- Mutating the caller-owned table after TriggerEvent returns must not alter the
+-- recorded observation when that queued event is eventually flushed.
+local flushCallbacks
+report, requests, _, flushCallbacks = loadCollector(true, 'staff-resource', true)
+context = { note = 'original', action = 'ban', sourceResource = 'spoofed-resource' }
+report(42, 'warn', context)
+assertEqual(#requests, 1, 'session acknowledgement should be pending')
+context.note = 'mutated after report'
+context.action = 'ban'
+context.sourceResource = 'mutated-resource'
+flushCallbacks()
+assertEqual(#requests, 2, 'queued observation should flush after acknowledgement')
+assertEqual(requests[2].body.payload.action, 'warn', 'queued action must remain collector-derived')
+assertEqual(requests[2].body.payload.sourceResource, 'staff-resource', 'queued source must remain collector-derived')
+assertEqual(requests[2].body.payload.note, 'original', 'queued context must be detached from the caller')
 
 print('conduct adapter tests passed')

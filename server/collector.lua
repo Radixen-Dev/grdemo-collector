@@ -152,6 +152,33 @@ local function copyMoney(money)
     return snapshot
 end
 
+-- Context comes from another resource. Detach it before a session-start
+-- callback can queue it, so that resource cannot alter collector-owned fields
+-- (or the recorded context) after TriggerEvent has returned.
+local function copyConductContext(context, depth, seen)
+    if type(context) ~= 'table' then return {} end
+    if depth >= 3 or seen[context] then return {} end
+
+    seen[context] = true
+    local copied = {}
+    local entries = 0
+    for key, value in pairs(context) do
+        if entries >= 64 then break end
+        if type(key) == 'string' and key ~= 'action' and key ~= 'sourceResource' then
+            local valueType = type(value)
+            if valueType == 'string' or valueType == 'number' or valueType == 'boolean' then
+                copied[key] = value
+                entries = entries + 1
+            elseif valueType == 'table' then
+                copied[key] = copyConductContext(value, depth + 1, seen)
+                entries = entries + 1
+            end
+        end
+    end
+    seen[context] = nil
+    return copied
+end
+
 emitEvent = function(source, eventType, payload)
     if not trackedEventSet[eventType] then return end
 
@@ -248,7 +275,7 @@ AddEventHandler('guildrate:conductAction', function(targetSource, action, contex
     if type(targetSource) ~= 'number' or type(action) ~= 'string' then return end
     local normalizedAction = action:lower()
     if normalizedAction ~= 'warn' and normalizedAction ~= 'kick' and normalizedAction ~= 'ban' then return end
-    local payload = type(context) == 'table' and context or {}
+    local payload = copyConductContext(context, 0, {})
     payload.action = normalizedAction
     payload.sourceResource = invokingResource
     emitEvent(targetSource, 'conduct_action', payload)
