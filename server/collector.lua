@@ -357,6 +357,11 @@ local function heartbeat()
         playerCount = #players,
         maxPlayers = GetConvarInt('sv_maxclients', 0),
         framework = Framework.GetName(),
+        collector = {
+            version = GetResourceMetadata(GetCurrentResourceName(), 'version', 0) or '0.2.0',
+            framework = Framework.GetName(),
+            capabilities = Framework.GetCapabilities(),
+        },
         players = players,
     })
 end
