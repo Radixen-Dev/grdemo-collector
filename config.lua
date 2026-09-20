@@ -24,6 +24,12 @@ Config.AfkMaxSampleGapSec = 120
 -- Set to false to only collect join/leave sessions, no framework payloads.
 Config.CollectFrameworkEvents = true
 
+-- Opt-in server-side adapter for resources that already make staff decisions.
+-- It only records an observed action; it never warns, kicks, bans, or changes
+-- gameplay. Server resources may call TriggerEvent('guildrate:conductAction',
+-- targetSource, action, context). Do not RegisterNetEvent this name.
+Config.CollectConductActions = false
+
 -- Explicit event allowlist forwarded from a framework adapter. Keeps payload
 -- volume predictable instead of mirroring every framework event verbatim.
 -- Remove entries you don't care about, e.g. drop 'money_change' if your
