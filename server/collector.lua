@@ -240,7 +240,8 @@ end
 -- observation sink, never an authority that performs the action itself.
 AddEventHandler('guildrate:conductAction', function(targetSource, action, context)
     if not Config.CollectConductActions then return end
-    if GetInvokingResource() == nil then
+    local invokingResource = GetInvokingResource()
+    if invokingResource == nil then
         print('[guildrate-collector] ignored conduct action without a server resource caller')
         return
     end
@@ -249,7 +250,7 @@ AddEventHandler('guildrate:conductAction', function(targetSource, action, contex
     if normalizedAction ~= 'warn' and normalizedAction ~= 'kick' and normalizedAction ~= 'ban' then return end
     local payload = type(context) == 'table' and context or {}
     payload.action = normalizedAction
-    payload.sourceResource = GetInvokingResource()
+    payload.sourceResource = invokingResource
     emitEvent(targetSource, 'conduct_action', payload)
 end)
 

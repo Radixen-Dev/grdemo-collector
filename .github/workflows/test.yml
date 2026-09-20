@@ -12,5 +12,7 @@ jobs:
       - uses: actions/checkout@v4
       - name: Install Lua
         run: sudo apt-get update && sudo apt-get install -y lua5.4
-      - name: Test capability manifests
-        run: lua test/framework_capabilities.lua
+      - name: Test collector contracts
+        run: |
+          lua test/framework_capabilities.lua
+          lua test/conduct_adapter.lua
