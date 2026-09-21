@@ -36,14 +36,32 @@ The collector detects ESX, QBCore, QBox, or vanilla FiveM automatically.
 Analytics receives only the FiveM `license` identifier needed to associate
 records with a player. Other platform identifiers (Discord, Steam, IP, and
 similar values) are not sent. The FiveM display name is retained because the
-Analytics API requires a player label; framework character IDs and names are
-not collected. Framework snapshots are limited to job/gang/group and numeric
-cash, bank, and crypto balances; arbitrary framework metadata is excluded.
-Event payloads use a fixed allowlist, and failed HTTP requests never print
-response bodies (which might contain sensitive server details). Events are
-attributable only to the acting player; the collector does not forward other
-players' identifiers to form relationship graphs. Disconnect reasons are also
-kept on the game server.
+Analytics API requires a player label. Framework snapshots are limited to
+job/gang/group, numeric cash/bank/crypto balances, and character identity (see
+below); arbitrary framework metadata is excluded. Event payloads use a fixed
+allowlist, and failed HTTP requests never print response bodies (which might
+contain sensitive server details). Events are attributable only to the acting
+player; the collector does not forward other players' identifiers to form
+relationship graphs. Disconnect reasons are also kept on the game server.
+
+### Character identity
+
+One FiveM license can play more than one in-game character over time (a
+"character slot"), and Analytics needs to tell those characters apart instead
+of merging their job, gang, and money history into a single identity. The
+collector forwards the minimum needed for that:
+
+- **QBCore / QBox**: `citizenid` (that framework's own stable per-character
+  id) and `charinfo.firstname`/`charinfo.lastname`. No other `charinfo` field
+  is read or sent.
+- **ESX**: base ESX has no native multi-character support, so its login
+  `identifier` already is a correct, stable per-character key; a
+  multi-character fork that assigns a distinct identifier per slot gets
+  correct per-character separation automatically. A best-effort character
+  name is sent only when `xPlayer.getName()` exists on the running build.
+- **Vanilla (no framework)**: no character identity is available or sent.
+
+No other character or inventory data is collected.
 
 ## AFK accounting
 
