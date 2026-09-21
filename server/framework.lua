@@ -3,8 +3,13 @@
 -- ESX, QBCore/QBox, or nothing at all.
 --
 -- getPlayerInfo returns only the small analytics projection needed by the
--- dashboard. Character IDs, names, platform identifiers, and arbitrary
--- framework metadata are deliberately excluded.
+-- dashboard. Platform identifiers (Discord, Steam, IP) and arbitrary
+-- framework metadata stay excluded. Character identity is the exception:
+-- a stable per-character id (QBCore/QBox citizenid, or the ESX identifier
+-- for frameworks without native multi-character support) and character
+-- first/last name are forwarded so Analytics can distinguish a player's
+-- separate characters instead of merging them into one identity. See the
+-- "Character identity" section of README.md for exactly what this sends.
 --
 -- Add a new framework by implementing the same shape (detect / init /
 -- getPlayerInfo / registerEvents) and registering it in `Adapters` below.
@@ -33,12 +38,33 @@ Adapters.esx = {
             group = xPlayer.group,
         }
 
+        -- Base ESX has no native multi-character support: one FiveM license
+        -- maps to one character slot, so the login identifier is already a
+        -- stable, correct per-character key -- but only on builds configured
+        -- to use the license as that identifier. On Steam-primary builds
+        -- xPlayer.identifier is a steam:... id, which platform-identifier
+        -- policy excludes, so only forward it when it matches the license
+        -- shape already required by getIdentifiers() in collector.lua.
+        if type(xPlayer.identifier) == 'string' and xPlayer.identifier:match('^license:%x+$') then
+            info.identifier = xPlayer.identifier
+        end
+
         -- getMoney/getAccount are standard on every ESX legacy build, but
         -- wrap defensively in case a fork renames or removes one.
         pcall(function() info.cash = xPlayer.getMoney() end)
         pcall(function()
             local bank = xPlayer.getAccount('bank')
             info.bank = bank and bank.money
+        end)
+        -- getName() is common on modern es_extended legacy builds but not
+        -- guaranteed across forks; fall back to no character name rather
+        -- than the FiveM display name, which the API already has.
+        pcall(function()
+            local name = xPlayer.getName and xPlayer.getName()
+            if type(name) == 'string' and name ~= '' then
+                local firstname, lastname = name:match('^(%S+)%s+(.*)$')
+                info.charinfo = { firstname = firstname or name, lastname = lastname or '' }
+            end
         end)
 
         return info
@@ -102,6 +128,15 @@ local QBCoreAdapter = {
                 cash = type(data.money.cash) == 'number' and data.money.cash or nil,
                 bank = type(data.money.bank) == 'number' and data.money.bank or nil,
                 crypto = type(data.money.crypto) == 'number' and data.money.crypto or nil,
+            },
+            -- citizenid is QBCore/QBox's own stable per-character identifier:
+            -- one license can hold several citizenids, one per character
+            -- slot. charinfo carries only the two name fields Analytics uses
+            -- to label a character; no other charinfo data is forwarded.
+            citizenid = type(data.citizenid) == 'string' and data.citizenid or nil,
+            charinfo = data.charinfo and {
+                firstname = data.charinfo.firstname,
+                lastname = data.charinfo.lastname,
             },
         }
     end,
