@@ -36,13 +36,18 @@ Adapters.esx = {
             job = xPlayer.job and { name = xPlayer.job.name, label = xPlayer.job.label, grade = xPlayer.job.grade },
             job2 = xPlayer.job2 and { name = xPlayer.job2.name, label = xPlayer.job2.label, grade = xPlayer.job2.grade },
             group = xPlayer.group,
-            -- Base ESX has no native multi-character support: one FiveM
-            -- license maps to one character slot, so its own login
-            -- identifier is already a stable, correct per-character key.
-            -- A multi-character fork that assigns a distinct identifier per
-            -- slot gets the same correct behavior for free.
-            identifier = xPlayer.identifier,
         }
+
+        -- Base ESX has no native multi-character support: one FiveM license
+        -- maps to one character slot, so the login identifier is already a
+        -- stable, correct per-character key -- but only on builds configured
+        -- to use the license as that identifier. On Steam-primary builds
+        -- xPlayer.identifier is a steam:... id, which platform-identifier
+        -- policy excludes, so only forward it when it matches the license
+        -- shape already required by getIdentifiers() in collector.lua.
+        if type(xPlayer.identifier) == 'string' and xPlayer.identifier:match('^license:%x+$') then
+            info.identifier = xPlayer.identifier
+        end
 
         -- getMoney/getAccount are standard on every ESX legacy build, but
         -- wrap defensively in case a fork renames or removes one.

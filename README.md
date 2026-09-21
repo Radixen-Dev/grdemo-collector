@@ -55,9 +55,12 @@ collector forwards the minimum needed for that:
   id) and `charinfo.firstname`/`charinfo.lastname`. No other `charinfo` field
   is read or sent.
 - **ESX**: base ESX has no native multi-character support, so its login
-  `identifier` already is a correct, stable per-character key; a
-  multi-character fork that assigns a distinct identifier per slot gets
-  correct per-character separation automatically. A best-effort character
+  `identifier` already is a correct, stable per-character key -- but only on
+  builds configured to use the license as that identifier. The collector only
+  forwards it when it matches the `license:...` shape; on Steam-primary
+  builds `xPlayer.identifier` is a `steam:...` id, which platform-identifier
+  policy excludes, so nothing is sent for those and only the FiveM license
+  (already sent, see above) identifies the player. A best-effort character
   name is sent only when `xPlayer.getName()` exists on the running build.
 - **Vanilla (no framework)**: no character identity is available or sent.
 
