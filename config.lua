@@ -41,3 +41,10 @@ Config.TrackedEvents = {
     'character_loaded',
     'character_unloaded',
 }
+
+-- Open Track API: caps how many exports('TrackEvent', ...) calls this
+-- resource accepts per player per minute. Custom events share the ingest
+-- HTTP path with session/heartbeat traffic, so this keeps a chatty script
+-- (e.g. a checkpoint fired every frame) from starving that load-bearing
+-- telemetry. See README.md "Track API" for the full contract.
+Config.TrackEventMaxPerMinute = 30

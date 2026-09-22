@@ -151,66 +151,232 @@ local function copyMoney(money)
     return snapshot
 end
 
+-- ---------------------------------------------------------------------------
+-- Track API: an open front door for anything outside the curated ESX/QBCore/
+-- QBox adapters -- a custom or modified framework, or a non-RP gamemode
+-- (racing, deathmatch, minigames) that has no framework at all. Every such
+-- event is namespaced "custom.<name>" so it can never collide with a
+-- framework event name, and is validated both here and, authoritatively, by
+-- the Worker (worker/ingest.ts applies the same shape rules server-side).
+-- ---------------------------------------------------------------------------
+
+local CUSTOM_EVENT_PREFIX = 'custom.'
+local CUSTOM_EVENT_NAME_SUFFIX_PATTERN = '^[%l%d_]+$'
+local MAX_CUSTOM_EVENT_NAME_LENGTH = 80
+local MAX_CUSTOM_PAYLOAD_KEYS = 20
+local MAX_CUSTOM_STRING_LENGTH = 200
+local MAX_CUSTOM_ARRAY_ITEMS = 20
+local MAX_CUSTOM_PAYLOAD_BYTES = 2000
+local TRACK_EVENT_WINDOW_MS = 60000
+
+local function hasCustomPrefix(name)
+    return type(name) == 'string' and name:sub(1, #CUSTOM_EVENT_PREFIX) == CUSTOM_EVENT_PREFIX
+end
+
+-- Strips control characters that have no business in a stored label. Shared
+-- by the framework-payload branch below and the custom-payload sanitizer,
+-- so there is exactly one "strip control characters" guarantee instead of
+-- two independently maintained ones -- the two paths still apply different
+-- length policies on top of it (see scrubText vs sanitizeCustomPayload),
+-- because they are different trust boundaries: framework fields come from
+-- this repo's own curated adapters and are safe to truncate, while Track
+-- API fields come from arbitrary third-party scripts and are held to the
+-- stricter, reject-not-truncate contract documented in README.md.
+local function stripControlChars(value)
+    if type(value) ~= 'string' then return nil end
+    return value:gsub('[%z\r\n]', ' ')
+end
+
+-- Framework payload fields: scrub, then truncate rather than reject on
+-- overflow (this data comes from the curated adapters, not arbitrary
+-- third-party input).
+local function scrubText(value, maxLength)
+    local scrubbed = stripControlChars(value)
+    if not scrubbed then return nil end
+    return #scrubbed > maxLength and scrubbed:sub(1, maxLength) or scrubbed
+end
+
+-- Custom payload fields: scrub, then reject (not truncate) on overflow --
+-- the Track API contract documented in README.md promises a 400/false
+-- rejection for an oversized field, not a silent truncation. Stripping
+-- control characters never changes string length (each match is replaced
+-- one-for-one with a space), so checking the scrubbed length is equivalent
+-- to checking the original.
+local function customScalarText(value)
+    local scrubbed = stripControlChars(value)
+    if not scrubbed or #scrubbed > MAX_CUSTOM_STRING_LENGTH then return nil end
+    return scrubbed
+end
+
+local function isCustomScalar(value)
+    local kind = type(value)
+    return kind == 'boolean' or kind == 'number'
+end
+
+-- A flat object of scalars or scalar arrays only -- deliberately tighter
+-- than framework event payloads, since a custom event can originate from
+-- any third-party script calling the public TrackEvent export. Returns
+-- (sanitizedPayload, true) or (nil, false) if the shape is rejected.
+local function sanitizeCustomPayload(payload)
+    if payload == nil then return {}, true end
+    if type(payload) ~= 'table' then return nil, false end
+    local safe = {}
+    local keyCount = 0
+    for key, value in pairs(payload) do
+        if type(key) ~= 'string' then return nil, false end
+        keyCount = keyCount + 1
+        if keyCount > MAX_CUSTOM_PAYLOAD_KEYS then return nil, false end
+        if type(value) == 'table' then
+            -- `ipairs` silently visits zero elements on a non-array table
+            -- (e.g. a nested object like `{ deep = 'value' }`), which would
+            -- let one through disguised as an empty array. Require every key
+            -- to be a dense 1-based integer sequence first, so a nested
+            -- object or a sparse/non-sequential table is rejected outright
+            -- rather than laundered into `{}`. Bail out the moment the count
+            -- goes over budget instead of finishing the scan, so a caller
+            -- can't force a full walk of an arbitrarily large table.
+            local totalKeys = 0
+            for tableKey in pairs(value) do
+                totalKeys = totalKeys + 1
+                if totalKeys > MAX_CUSTOM_ARRAY_ITEMS
+                    or type(tableKey) ~= 'number' or tableKey % 1 ~= 0 or tableKey < 1 then
+                    return nil, false
+                end
+            end
+            local safeArray = {}
+            for index = 1, totalKeys do
+                local item = value[index]
+                if item == nil then return nil, false end
+                if type(item) == 'string' then
+                    item = customScalarText(item)
+                    if item == nil then return nil, false end
+                elseif not isCustomScalar(item) then
+                    return nil, false
+                end
+                safeArray[index] = item
+            end
+            safe[key] = safeArray
+        elseif type(value) == 'string' then
+            local scrubbed = customScalarText(value)
+            if scrubbed == nil then return nil, false end
+            safe[key] = scrubbed
+        elseif isCustomScalar(value) then
+            safe[key] = value
+        else
+            return nil, false
+        end
+    end
+    local ok, encoded = pcall(json.encode, safe)
+    if not ok or #encoded > MAX_CUSTOM_PAYLOAD_BYTES then return nil, false end
+    return safe, true
+end
+
+-- Custom events share the ingest HTTP path with session/heartbeat traffic.
+-- A chatty custom script -- a checkpoint fired every frame, say -- must not
+-- be able to starve that load-bearing telemetry, so it gets its own,
+-- tighter, per-player budget on top. The window lives on the session table
+-- itself so it rides the same create/destroy lifecycle as everything else
+-- in `openSessions` (cleared on disconnect in `playerDropped`) instead of
+-- being a second piece of per-source state nothing tears down -- source IDs
+-- are recycled by FiveM, so a standalone table keyed by source would let a
+-- reconnecting player inherit a stale window. It's timed off GetGameTimer(),
+-- not os.time(), so a wall-clock adjustment can't wedge a window open.
+local function trackEventAllowed(session, source)
+    local nowMs = GetGameTimer()
+    local window = session.trackEventWindow
+    if not window or nowMs - window.windowStart >= TRACK_EVENT_WINDOW_MS then
+        window = { windowStart = nowMs, count = 0, warned = false }
+        session.trackEventWindow = window
+    end
+    window.count = window.count + 1
+    if window.count > Config.TrackEventMaxPerMinute then
+        if not window.warned then
+            print(('[guildrate-collector] TrackEvent rate limit exceeded for source %s (max %d/min); further calls this window are dropped')
+                :format(tostring(source), Config.TrackEventMaxPerMinute))
+            window.warned = true
+        end
+        return false
+    end
+    return true
+end
+
+-- Returns true if the event was accepted (queued for delivery or sent),
+-- false if it was dropped -- callers that report the outcome to a caller
+-- of their own (the TrackEvent export) must propagate this, not assume
+-- success.
 emitEvent = function(source, eventType, payload)
-    if not trackedEventSet[eventType] then return end
+    local isCustomEvent = hasCustomPrefix(eventType)
+    if not isCustomEvent and not trackedEventSet[eventType] then return false end
 
     local session = openSessions[source]
     if not session then
         session = startSession(source, GetPlayerName(source) or ('Player ' .. tostring(source)))
         if not session then
             print(('[guildrate-collector] unable to recover %s for source %s: no stable license'):format(eventType, tostring(source)))
-            return
+            return false
         end
     end
+
+    if isCustomEvent and not trackEventAllowed(session, source) then return false end
 
     if not session.sessionId then
         table.insert(session.pendingEvents, { eventType = eventType, payload = payload })
-        return
+        return true
     end
 
     payload = payload or {}
+    local safePayload
 
-    -- Framework adapters return an intentionally small, analytics-oriented
-    -- shape. Event payloads are also allowlisted here so a framework update
-    -- cannot accidentally cause arbitrary metadata or identifiers to leak.
-    local safePayload = {}
-    local function safeText(value, maxLength)
-        if type(value) ~= 'string' then return nil end
-        value = value:gsub('[%z\r\n]', ' ')
-        return #value > maxLength and value:sub(1, maxLength) or value
-    end
-    local function safeJob(value)
-        if type(value) ~= 'table' then return nil end
-        return {
-            name = safeText(value.name, 128),
-            label = safeText(value.label, 128),
-            grade = type(value.grade) == 'number' and value.grade or nil,
-            onDuty = type(value.onDuty) == 'boolean' and value.onDuty or nil,
-        }
-    end
-    if eventType == 'player_death' then
-        safePayload.weaponHash = type(payload.weaponHash) == 'number' and payload.weaponHash or nil
-        safePayload.killerType = type(payload.killerType) == 'number' and payload.killerType or nil
-    elseif eventType == 'job_change' then
-        safePayload.job = safeJob(payload.job)
-        safePayload.previousJob = safeText(payload.previousJob, 128)
-    elseif eventType == 'job2_change' then
-        safePayload.job2 = safeJob(payload.job2)
-        safePayload.previousJob2 = safeText(payload.previousJob2, 128)
-    elseif eventType == 'gang_change' then
-        safePayload.gang = safeJob(payload.gang)
-    elseif eventType == 'group_change' then
-        safePayload.group = safeText(payload.group, 128)
-    elseif eventType == 'money_change' then
-        for _, key in ipairs({ 'moneyType', 'account', 'operation' }) do
-            safePayload[key] = safeText(payload[key], 128)
+    if isCustomEvent then
+        local sanitized, ok = sanitizeCustomPayload(payload)
+        if not ok then
+            print(('[guildrate-collector] dropped invalid TrackEvent payload for "%s" (source %s): must be a flat object of at most %d scalar/array-of-scalar fields, %d bytes total')
+                :format(eventType, tostring(source), MAX_CUSTOM_PAYLOAD_KEYS, MAX_CUSTOM_PAYLOAD_BYTES))
+            return false
         end
-        for _, key in ipairs({ 'amount', 'balance', 'previousAmount' }) do
-            if type(payload[key]) == 'number' then safePayload[key] = payload[key] end
+        -- Custom events come from scripts outside the curated framework
+        -- adapters, so they never carry a framework playerInfo snapshot --
+        -- the Worker also refuses to project a character snapshot from one.
+        safePayload = sanitized
+    else
+        -- Framework adapters return an intentionally small, analytics-oriented
+        -- shape. Event payloads are also allowlisted here so a framework
+        -- update cannot accidentally cause arbitrary metadata or identifiers
+        -- to leak.
+        safePayload = {}
+        local function safeJob(value)
+            if type(value) ~= 'table' then return nil end
+            return {
+                name = scrubText(value.name, 128),
+                label = scrubText(value.label, 128),
+                grade = type(value.grade) == 'number' and value.grade or nil,
+                onDuty = type(value.onDuty) == 'boolean' and value.onDuty or nil,
+            }
         end
-        if payload.observedByHeartbeat == true then safePayload.observedByHeartbeat = true end
+        if eventType == 'player_death' then
+            safePayload.weaponHash = type(payload.weaponHash) == 'number' and payload.weaponHash or nil
+            safePayload.killerType = type(payload.killerType) == 'number' and payload.killerType or nil
+        elseif eventType == 'job_change' then
+            safePayload.job = safeJob(payload.job)
+            safePayload.previousJob = scrubText(payload.previousJob, 128)
+        elseif eventType == 'job2_change' then
+            safePayload.job2 = safeJob(payload.job2)
+            safePayload.previousJob2 = scrubText(payload.previousJob2, 128)
+        elseif eventType == 'gang_change' then
+            safePayload.gang = safeJob(payload.gang)
+        elseif eventType == 'group_change' then
+            safePayload.group = scrubText(payload.group, 128)
+        elseif eventType == 'money_change' then
+            for _, key in ipairs({ 'moneyType', 'account', 'operation' }) do
+                safePayload[key] = scrubText(payload[key], 128)
+            end
+            for _, key in ipairs({ 'amount', 'balance', 'previousAmount' }) do
+                if type(payload[key]) == 'number' then safePayload[key] = payload[key] end
+            end
+            if payload.observedByHeartbeat == true then safePayload.observedByHeartbeat = true end
+        end
+        safePayload.playerInfo = Framework.GetPlayerInfo(source)
     end
-    safePayload.playerInfo = Framework.GetPlayerInfo(source)
     payload = safePayload
 
     -- Keep the heartbeat fallback in sync with framework-originated money
@@ -232,7 +398,52 @@ emitEvent = function(source, eventType, payload)
         idempotencyKey = eventKey(source),
         participants = participants,
     })
+    return true
 end
+
+-- Public Track API. Any resource can report a custom event without a
+-- dedicated framework adapter:
+--   local ok = exports['guildrate-collector']:TrackEvent(source, 'race_finished', {
+--       track = 'sandy-shores', placement = 1, timeMs = 92340,
+--   })
+-- `name` is namespaced "custom.<name>" automatically if not already
+-- prefixed. Returns true if the event was accepted and queued for delivery,
+-- false if it was rejected (invalid source/name, no stable license,
+-- oversized or malformed payload, or the per-player rate limit). Rejections
+-- are logged server-side with the reason; this export never throws.
+--
+-- Contract (stable once released -- see README.md "Track API"):
+--   - event names: lowercase letters, digits, and underscores only, at most
+--     80 characters (after the "custom." namespace)
+--   - payload: a flat object of at most 20 fields, each a string (<=200
+--     chars), number, boolean, null, or an array of up to 20 such scalars;
+--     2000 bytes total. Nested objects are rejected.
+--   - rate limit: Config.TrackEventMaxPerMinute calls per player per minute
+exports('TrackEvent', function(source, name, payload)
+    local resolvedSource = tonumber(source)
+    if not resolvedSource then
+        print(('[guildrate-collector] TrackEvent rejected: source %s is not a valid player id'):format(tostring(source)))
+        return false
+    end
+    if type(name) ~= 'string' then
+        print('[guildrate-collector] TrackEvent rejected: event name must be a string')
+        return false
+    end
+
+    local fullName = hasCustomPrefix(name) and name or (CUSTOM_EVENT_PREFIX .. name)
+    local suffix = fullName:sub(#CUSTOM_EVENT_PREFIX + 1)
+    if #suffix < 1 or #suffix > MAX_CUSTOM_EVENT_NAME_LENGTH or not suffix:match(CUSTOM_EVENT_NAME_SUFFIX_PATTERN) then
+        print(('[guildrate-collector] TrackEvent rejected: "%s" must be lowercase letters, digits, and underscores only (max %d characters)')
+            :format(name, MAX_CUSTOM_EVENT_NAME_LENGTH))
+        return false
+    end
+
+    -- emitEvent is the single source of truth for whether the player has a
+    -- stable license (it already recovers/creates the session), so its
+    -- outcome is propagated here rather than re-checked with a separate,
+    -- weaker liveness test that could disagree with it.
+    return emitEvent(resolvedSource, fullName, payload) == true
+end)
 
 local function observeMoneyChanges(source, session)
     local playerInfo = Framework.GetPlayerInfo(source)
