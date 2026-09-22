@@ -5,10 +5,14 @@
 -- getPlayerInfo returns only the small analytics projection needed by the
 -- dashboard. Platform identifiers (Discord, Steam, IP) and arbitrary
 -- framework metadata stay excluded. Character identity is the exception:
--- a stable per-character id (QBCore/QBox citizenid, or the ESX identifier
--- for frameworks without native multi-character support) and character
--- first/last name are forwarded so Analytics can distinguish a player's
--- separate characters instead of merging them into one identity. See the
+-- a stable per-character id (QBCore/QBox citizenid, or the ESX identifier,
+-- including its native multi-character `charN:license:...` form) and
+-- character first/last name are forwarded so Analytics can distinguish a
+-- player's separate characters instead of merging them into one identity.
+-- When the character slot number itself is known (QBCore/QBox `cid`, or the
+-- `N` in an ESX `charN:` prefix) it is forwarded too, as `info.cid`, so
+-- Analytics can tell "N concurrent character slots" apart from "N
+-- characters accumulated over time via delete+recreate". See the
 -- "Character identity" section of README.md for exactly what this sends.
 --
 -- Add a new framework by implementing the same shape (detect / init /
@@ -17,6 +21,16 @@
 Framework = {}
 
 local Adapters = {}
+
+-- Normalizes a raw character-slot value into a positive integer, or nil if
+-- it isn't one. Covers both QBCore/QBox PlayerData.cid (which some builds
+-- or forks surface as a string, e.g. "1", rather than a number) and the
+-- digit string captured from an ESX `charN:` identifier prefix.
+local function toSlot(value)
+    local n = tonumber(value)
+    if type(n) == 'number' and n >= 1 and n % 1 == 0 then return n end
+    return nil
+end
 
 -- ---------------------------------------------------------------------------
 -- ESX (tested against es_extended "legacy")
@@ -41,12 +55,25 @@ Adapters.esx = {
         -- Base ESX has no native multi-character support: one FiveM license
         -- maps to one character slot, so the login identifier is already a
         -- stable, correct per-character key -- but only on builds configured
-        -- to use the license as that identifier. On Steam-primary builds
-        -- xPlayer.identifier is a steam:... id, which platform-identifier
-        -- policy excludes, so only forward it when it matches the license
-        -- shape already required by getIdentifiers() in collector.lua.
-        if type(xPlayer.identifier) == 'string' and xPlayer.identifier:match('^license:%x+$') then
-            info.identifier = xPlayer.identifier
+        -- to use the license as that identifier. Some ESX builds instead run
+        -- native multicharacter, where the identifier carries an explicit
+        -- `char<N>:` slot prefix in front of the license (e.g.
+        -- `char2:license:abcd...`); that is still a stable, distinct
+        -- per-character key and must be forwarded whole -- stripping the
+        -- prefix down to the bare license would collapse genuinely distinct
+        -- characters back into a single identity. On Steam-primary builds
+        -- xPlayer.identifier is a steam:... id (with or without a char<N>:
+        -- prefix), which platform-identifier policy excludes, so only
+        -- forward it when the license-shaped suffix required by
+        -- getIdentifiers() in collector.lua is present, in either form.
+        if type(xPlayer.identifier) == 'string' then
+            local slotDigits = xPlayer.identifier:match('^char(%d+):license:%x+$')
+            if slotDigits then
+                info.identifier = xPlayer.identifier
+                info.cid = toSlot(slotDigits)
+            elseif xPlayer.identifier:match('^license:%x+$') then
+                info.identifier = xPlayer.identifier
+            end
         end
 
         -- getMoney/getAccount are standard on every ESX legacy build, but
@@ -134,6 +161,13 @@ local QBCoreAdapter = {
             -- slot. charinfo carries only the two name fields Analytics uses
             -- to label a character; no other charinfo data is forwarded.
             citizenid = type(data.citizenid) == 'string' and data.citizenid or nil,
+            -- cid is the character *slot number* (typically 1-5), distinct
+            -- from citizenid: it tells Analytics how many concurrent
+            -- character slots a license is using, separate from how many
+            -- citizenids it has accumulated over time via delete+recreate.
+            -- It's a small integer, not sensitive, but is still an explicit,
+            -- deliberate addition -- see README.md "Character identity".
+            cid = toSlot(data.cid),
             charinfo = data.charinfo and {
                 firstname = data.charinfo.firstname,
                 lastname = data.charinfo.lastname,

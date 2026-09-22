@@ -48,20 +48,33 @@ relationship graphs. Disconnect reasons are also kept on the game server.
 
 One FiveM license can play more than one in-game character over time (a
 "character slot"), and Analytics needs to tell those characters apart instead
-of merging their job, gang, and money history into a single identity. The
-collector forwards the minimum needed for that:
+of merging their job, gang, and money history into a single identity. Where
+the character *slot number* itself is known (e.g. "slot 2 of 5"), the
+collector also forwards that small integer so Analytics can distinguish a
+handful of concurrently-used slots from many characters accumulated over time
+via delete+recreate. The collector forwards the minimum needed for that:
 
 - **QBCore / QBox**: `citizenid` (that framework's own stable per-character
   id) and `charinfo.firstname`/`charinfo.lastname`. No other `charinfo` field
-  is read or sent.
+  is read or sent. The character slot number (`PlayerData.cid`, typically
+  1-5) is also forwarded.
 - **ESX**: base ESX has no native multi-character support, so its login
   `identifier` already is a correct, stable per-character key -- but only on
-  builds configured to use the license as that identifier. The collector only
-  forwards it when it matches the `license:...` shape; on Steam-primary
-  builds `xPlayer.identifier` is a `steam:...` id, which platform-identifier
-  policy excludes, so nothing is sent for those and only the FiveM license
-  (already sent, see above) identifies the player. A best-effort character
-  name is sent only when `xPlayer.getName()` exists on the running build.
+  builds configured to use the license as that identifier. Some ESX builds
+  instead run native multicharacter, where the identifier carries an
+  explicit `char<N>:` slot prefix in front of the license (e.g.
+  `char2:license:abcd...`); the collector forwards that identifier whole,
+  including the prefix, since each `charN:` value is itself a stable,
+  distinct per-character key -- stripping the prefix down to the bare
+  license would wrongly merge separate characters into one identity. The
+  slot number `N` is forwarded separately too, the same as QBCore/QBox's.
+  The collector only forwards an identifier when it matches the
+  `license:...` shape, with or without a `char<N>:` prefix; on
+  Steam-primary builds `xPlayer.identifier` is a `steam:...` id, which
+  platform-identifier policy excludes (even when it carries a `char<N>:`
+  prefix), so nothing is sent for those and only the FiveM license (already
+  sent, see above) identifies the player. A best-effort character name is
+  sent only when `xPlayer.getName()` exists on the running build.
 - **Vanilla (no framework)**: no character identity is available or sent.
 
 No other character or inventory data is collected.
