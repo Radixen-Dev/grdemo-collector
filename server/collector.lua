@@ -324,6 +324,28 @@ emitEvent = function(source, eventType, payload)
         return true
     end
 
+    -- player_respawned is ambiguous at the source (ESX's onPlayerSpawn fires
+    -- on a character's very first spawn too, not only after a death; see
+    -- framework.lua). Only forward it once this session has an unmatched
+    -- death to pair it with -- an ordinary join-spawn is dropped here,
+    -- silently and without penalty (this is the expected, common case, not
+    -- an error). session.awaitingRespawn is armed both by the player_death
+    -- branch below and, independently, by observeDeathJailField's own
+    -- isdead-false-to-true detection, so this gate works whether or not the
+    -- dedicated player_death hooks happened to fire for a given death.
+    --
+    -- Deliberately placed after the pendingEvents queue above, not before:
+    -- an event queued while sessionId was still unresolved re-enters
+    -- emitEvent a second time on replay (see startSession's callback), and
+    -- consuming the gate on the first (queue-only) pass would make the
+    -- replay -- the pass that actually sends it -- find it already
+    -- consumed and drop it. This runs exactly once, at the point an event
+    -- is actually about to be sent.
+    if eventType == 'player_respawned' then
+        if not session.awaitingRespawn then return false end
+        session.awaitingRespawn = false
+    end
+
     payload = payload or {}
     local safePayload
 
@@ -356,6 +378,28 @@ emitEvent = function(source, eventType, payload)
         if eventType == 'player_death' then
             safePayload.weaponHash = type(payload.weaponHash) == 'number' and payload.weaponHash or nil
             safePayload.killerType = type(payload.killerType) == 'number' and payload.killerType or nil
+            -- Arms the player_respawned gate above. Harmless to set again if
+            -- observeDeathJailField already armed it independently for this
+            -- same death (QBCore/QBox).
+            session.awaitingRespawn = true
+        elseif eventType == 'player_respawned' then
+            -- No fields: this event is purely the fact and timing of the
+            -- transition. Analytics pairs it with the preceding player_death
+            -- (same player, next respawn in the same session) to derive
+            -- "death downtime" -- see docs/METRICS_ROADMAP.md for why this is
+            -- named downtime, not time-to-revive: no framework distinguishes
+            -- an EMS revive from a bleed-out respawn at this signal.
+        elseif eventType == 'player_jailed' then
+            -- sentenceMinutes is read directly from QBCore/QBox's own
+            -- metadata.injail, which both frameworks' own type/config
+            -- comments label "time in minutes" -- carried as-is, not
+            -- authoritative (a fork could use a different unit or a
+            -- countdown that doesn't mean "sentence length").
+            safePayload.sentenceMinutes = type(payload.sentenceMinutes) == 'number' and payload.sentenceMinutes or nil
+        elseif eventType == 'player_released' then
+            -- No fields, same reasoning as player_respawned: Analytics
+            -- derives jail time served by pairing this with the preceding
+            -- player_jailed.
         elseif eventType == 'job_change' then
             safePayload.job = safeJob(payload.job)
             safePayload.previousJob = scrubText(payload.previousJob, 128)
@@ -474,6 +518,83 @@ local function observeMoneyChanges(source, session)
 end
 
 -- ---------------------------------------------------------------------------
+-- Death downtime / jail time (QBCore/QBox core metadata only -- see
+-- README.md "Character depth: death downtime and jail time" for the full
+-- reasoning). isdead and injail are schema'd and defaulted by qb-core/
+-- qbx_core themselves but only ever mutated by whichever job resource is
+-- installed, via core's own SetMetaData/SetMetadata -- never by core
+-- directly. observeDeathJailField hooks that core mutation-notification
+-- mechanism (or, as a backstop, reads the current value on the heartbeat),
+-- not any specific job resource's event names, so it stays correct
+-- regardless of which (or whether any) job resource is installed.
+--
+-- One session-scoped snapshot (session.deathJailSnapshot), diffed one field
+-- at a time so the same function serves three call sites: the QBox event
+-- (precise, gives old/new directly), the QBCore event (coarser, gives the
+-- whole current metadata table -- decomposed into two single-field calls by
+-- framework.lua), and the heartbeat backstop (catches anything either event
+-- missed, e.g. a job resource that mutates metadata without ever reaching a
+-- listening event, up to one heartbeat interval late). Calling this
+-- repeatedly with the same value is always safe: a value equal to the last
+-- known one is not a transition and emits nothing.
+--
+-- The first observation of a field only seeds the snapshot; it never emits.
+-- This is deliberate, not an oversight: a player who reconnects already
+-- jailed (server restarted mid-sentence, or they logged in on a fresh
+-- session after being jailed in a previous one) must not have that
+-- pre-existing state misreported as a jailing that started at reconnect.
+-- The corresponding tradeoff -- a sentence that started before this
+-- session's first observation is invisible to it -- is the same class of
+-- best-effort limitation already accepted for observeMoneyChanges above.
+--
+-- This snapshot is per-connection (keyed by session, same as everything
+-- else in openSessions), not per-character: a character switch
+-- (character_unloaded/character_loaded) does not reset it. A death as one
+-- character followed by a character switch and then a respawn signal as a
+-- *different* character on the same connection would be paired together as
+-- one (misleadingly short) downtime sample -- a known, documented gap, not
+-- silently wrong on purpose. `events` carries no character_id today to
+-- disambiguate against.
+local function observeDeathJailField(source, field, rawValue)
+    local session = openSessions[source]
+    if not session then return end
+    local snapshot = session.deathJailSnapshot
+    if not snapshot then
+        snapshot = { seen = {} }
+        session.deathJailSnapshot = snapshot
+    end
+
+    if field == 'isdead' then
+        local value = rawValue == true
+        if snapshot.seen.isdead then
+            if snapshot.isdead == true and value == false then
+                emitEvent(source, 'player_respawned', {})
+            elseif snapshot.isdead == false and value == true then
+                -- Independently arms the player_respawned gate in
+                -- emitEvent, whether or not a dedicated player_death hook
+                -- also fired for this same death (it may not have, on a
+                -- fork not using any of the three known event names).
+                session.awaitingRespawn = true
+            end
+        end
+        snapshot.isdead = value
+        snapshot.seen.isdead = true
+    elseif field == 'injail' then
+        local value = tonumber(rawValue) or 0
+        if snapshot.seen.injail then
+            local previous = snapshot.injail or 0
+            if previous <= 0 and value > 0 then
+                emitEvent(source, 'player_jailed', { sentenceMinutes = value })
+            elseif previous > 0 and value <= 0 then
+                emitEvent(source, 'player_released', {})
+            end
+        end
+        snapshot.injail = value
+        snapshot.seen.injail = true
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- AFK accounting
 -- ---------------------------------------------------------------------------
 
@@ -561,6 +682,18 @@ local function heartbeat()
             observeAfkTime(source, session, observedAt)
             players[#players + 1] = { license = session.identifiers.license, playerInfo = Framework.GetPlayerInfo(source) }
             observeMoneyChanges(source, session)
+            -- Backstop only: on QBCore/QBox, the dedicated metadata events
+            -- (wired in framework.lua) normally catch isdead/injail
+            -- transitions immediately. This reconciles anything they missed,
+            -- up to one heartbeat interval late. Returns nil for ESX/vanilla
+            -- (no adapter-level implementation), so this is a no-op there --
+            -- ESX's death-downtime signal is purely event-driven (see
+            -- framework.lua's esx:onPlayerSpawn handler).
+            local deathJailState = Framework.GetDeathJailState(source)
+            if type(deathJailState) == 'table' then
+                observeDeathJailField(source, 'isdead', deathJailState.isdead)
+                observeDeathJailField(source, 'injail', deathJailState.injail)
+            end
         end
     end
 
@@ -574,7 +707,7 @@ end
 
 CreateThread(function()
     Framework.Init()
-    Framework.RegisterEvents(emitEvent)
+    Framework.RegisterEvents(emitEvent, observeDeathJailField)
 
     -- Resources can be restarted while players are online. Re-register those
     -- players so reporting continues instead of losing the in-memory session

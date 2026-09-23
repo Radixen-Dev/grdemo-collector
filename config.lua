@@ -29,10 +29,26 @@ Config.CollectFrameworkEvents = true
 -- Remove entries you don't care about, e.g. drop 'money_change' if your
 -- server pays out frequently and you don't want an event per paycheck.
 --
--- ESX emits:    player_death, job_change, job2_change, money_change, group_change, character_loaded
--- QBCore emits: player_death, job_change, gang_change, money_change, character_loaded, character_unloaded
+-- ESX emits:         player_death, player_respawned, job_change, job2_change,
+--                    money_change, group_change, character_loaded
+-- QBCore/QBox emit:  player_death, player_respawned, player_jailed,
+--                    player_released, job_change, gang_change, money_change,
+--                    character_loaded, character_unloaded
+--
+-- player_respawned is derived, not raw: it only reaches Analytics when it
+-- can be paired with a preceding player_death for the same session (an
+-- ordinary join/character-select spawn is not a respawn and is dropped
+-- before it gets here). player_jailed/player_released are QBCore/QBox only
+-- -- built from core's own isdead/injail metadata fields, never from any
+-- specific ambulance/police job resource's event names (see
+-- server/framework.lua and README.md "Character depth: death downtime and
+-- jail time" for exactly why, and why base ESX has no equivalent jail
+-- signal at all).
 Config.TrackedEvents = {
     'player_death',
+    'player_respawned',
+    'player_jailed',
+    'player_released',
     'job_change',
     'job2_change',
     'gang_change',
