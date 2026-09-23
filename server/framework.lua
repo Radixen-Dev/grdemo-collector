@@ -17,6 +17,10 @@
 --
 -- Add a new framework by implementing the same shape (detect / init /
 -- getPlayerInfo / registerEvents) and registering it in `Adapters` below.
+-- getDeathJailState is optional (QBCore/QBox only today): an internal-only
+-- accessor, never forwarded as-is, used to reconcile death-downtime/jail-time
+-- tracking on the heartbeat when the dedicated events below are missed. See
+-- README.md "Character depth: death downtime and jail time".
 
 Framework = {}
 
@@ -96,14 +100,67 @@ Adapters.esx = {
 
         return info
     end,
-    registerEvents = function(self, emit)
-        -- Both event names have shipped across different ESX legacy versions;
-        -- registering both is harmless if only one ever fires.
-        AddEventHandler('esx:onPlayerDeath', function(source)
-            emit(source, 'player_death', {})
+    registerEvents = function(self, emit, observe)
+        -- Both event names have shipped across different ESX legacy
+        -- versions; registering both is harmless if only one ever fires.
+        -- Neither declares a bare `function(source)` parameter, and neither
+        -- assumes the ambient FXServer `source` global either -- both
+        -- premises are live at once across ESX builds/forks: current
+        -- es_extended triggers esx:onPlayerDeath as
+        -- `TriggerServerEvent("esx:onPlayerDeath", data)` (a death-info
+        -- table, no source -- verified against current es_extended source),
+        -- where a `function(source)` parameter would shadow the ambient
+        -- global with that table and silently break every downstream lookup
+        -- (GetPlayerName/GetPlayerIdentifiers on a table argument). But an
+        -- older or forked convention triggering `esx:playerDeath` as
+        -- `TriggerEvent('esx:playerDeath', playerId)` -- a real numeric
+        -- source as the first argument -- is equally plausible and
+        -- unverified either way; a bare-`source` handler would silently
+        -- break *that* premise instead. `tonumber(candidate) or source`
+        -- (mirroring hospital:server:PlayerDied below) is correct under
+        -- both: it resolves to the real id when one was actually passed,
+        -- and falls back to the ambient global when the first argument is a
+        -- table or absent. Found while verifying player_death firing
+        -- reliability for the new death-downtime pairing below; fixed here
+        -- since an unreliable player_death directly undermines it. Death
+        -- `data` itself (killer/weapon/distance) is not forwarded -- out of
+        -- scope here, unchanged from before.
+        AddEventHandler('esx:onPlayerDeath', function(playerSource)
+            local resolvedSource = tonumber(playerSource) or source
+            if resolvedSource then emit(resolvedSource, 'player_death', {}) end
         end)
-        AddEventHandler('esx:playerDeath', function(source)
-            emit(source, 'player_death', {})
+        AddEventHandler('esx:playerDeath', function(playerSource)
+            local resolvedSource = tonumber(playerSource) or source
+            if resolvedSource then emit(resolvedSource, 'player_death', {}) end
+        end)
+
+        -- Base ESX has no server-side "dead" state at all (verified against
+        -- es_extended core: no such field on the server player class) --
+        -- only this respawn signal, which is genuinely core (part of
+        -- es_extended itself, fired both server- and client-side) but is
+        -- ambiguous: it also fires on a character's very first spawn after
+        -- joining, not only after a death. collector.lua's emitEvent only
+        -- turns this into a player_respawned event when a player_death was
+        -- already observed for this session and not yet matched (its
+        -- awaitingRespawn gate); an ordinary join-spawn is silently dropped.
+        -- esx:onPlayerSpawn is triggered server-side with no argument
+        -- (`TriggerServerEvent("esx:onPlayerSpawn")`, verified against
+        -- current es_extended source), so the ambient global is the only
+        -- source available there. playerSpawned has no confirmed
+        -- server-side FXServer native by that name (unlike client-side,
+        -- where it's a real native) -- it is registered defensively, same
+        -- spirit as the baseevents handlers below, in case a specific build
+        -- or resource re-fires it server-side; if nothing ever triggers it,
+        -- this handler simply never runs. Both use the same
+        -- tonumber-with-fallback resolution as the death handlers above, so
+        -- neither can pass a non-numeric or nil source down to emit().
+        AddEventHandler('esx:onPlayerSpawn', function(playerSource)
+            local resolvedSource = tonumber(playerSource) or source
+            if resolvedSource then emit(resolvedSource, 'player_respawned', {}) end
+        end)
+        AddEventHandler('playerSpawned', function(playerSource)
+            local resolvedSource = tonumber(playerSource) or source
+            if resolvedSource then emit(resolvedSource, 'player_respawned', {}) end
         end)
 
         AddEventHandler('esx:setJob', function(source, job, lastJob)
@@ -143,6 +200,22 @@ local QBCoreAdapter = {
     init = function(self)
         self.QBCore = exports['qb-core']:GetCoreObject()
     end,
+    -- Small, internal-only accessor -- unlike getPlayerInfo, this is never
+    -- forwarded to Analytics as-is. It exists so collector.lua can diff
+    -- isdead/injail across observations (heartbeat backstop) without reading
+    -- the rest of the metadata blob. See "Character depth: death downtime
+    -- and jail time" in README.md for exactly what's derived from it and
+    -- sent.
+    getDeathJailState = function(self, source)
+        local Player = self.QBCore.Functions.GetPlayer(source)
+        if not Player then return nil end
+        local metadata = Player.PlayerData.metadata
+        if type(metadata) ~= 'table' then return nil end
+        return {
+            isdead = metadata.isdead == true,
+            injail = type(metadata.injail) == 'number' and metadata.injail or 0,
+        }
+    end,
     getPlayerInfo = function(self, source)
         local Player = self.QBCore.Functions.GetPlayer(source)
         if not Player then return nil end
@@ -174,7 +247,43 @@ local QBCoreAdapter = {
             },
         }
     end,
-    registerEvents = function(self, emit)
+    registerEvents = function(self, emit, observe)
+        -- Neither isdead nor injail is ever set by qb-core/qbx_core itself --
+        -- both are schema'd and defaulted by core (see README.md), but only
+        -- mutated by whichever ambulance/police job resource (if any) is
+        -- installed, via core's own SetMetaData/SetMetadata. These two
+        -- handlers hook that core mutation-notification mechanism itself,
+        -- not any specific job resource's event names, so they work
+        -- regardless of which (or whether any) job resource is installed,
+        -- as long as it uses the sanctioned core API to persist its change
+        -- (the only way such a change would sync to the client or survive a
+        -- save anyway). `observe` diffs against the last known value and
+        -- emits player_respawned/player_jailed/player_released on the
+        -- meaningful transitions; see collector.lua's
+        -- observeDeathJailField.
+        --
+        -- QBCore only fires the coarser 'metadata' key with the *whole*
+        -- current metadata table (no old value), on every SetMetaData call
+        -- for any field (hunger/thirst included) -- observe() ignores
+        -- everything except isdead/injail.
+        AddEventHandler('QBCore:Server:OnPlayerUpdated', function(source, key, val)
+            if key ~= 'metadata' or type(val) ~= 'table' then return end
+            observe(source, 'isdead', val.isdead)
+            observe(source, 'injail', val.injail)
+        end)
+        -- qbx_core fires a precise per-field event with the specific old and
+        -- new value already computed -- no diffing needed on this path, just
+        -- forward it. Defensive about argument shape in case a future
+        -- qbx_core release reorders parameters: fail closed (do nothing)
+        -- rather than misattribute a value to the wrong field.
+        AddEventHandler('qbx_core:server:onSetMetaData', function(metadata, _oldValue, value, metaSource)
+            if type(metadata) ~= 'string' then return end
+            if metadata ~= 'isdead' and metadata ~= 'injail' then return end
+            local resolvedSource = tonumber(metaSource) or source
+            if not resolvedSource then return end
+            observe(resolvedSource, metadata, value)
+        end)
+
         AddEventHandler('QBCore:Server:OnJobUpdate', function(source, job)
             emit(source, 'job_change', {
                 job = job and { name = job.name, label = job.label, grade = job.grade, onDuty = job.onduty },
@@ -198,8 +307,12 @@ local QBCoreAdapter = {
         -- Not part of qb-core itself (comes from qb-ambulancejob), but common
         -- enough on QBCore servers that it's worth wiring up defensively —
         -- registering it is a no-op if that resource isn't installed.
+        -- tonumber() guards against a fork passing something other than a
+        -- bare numeric/string source (a table is truthy and would otherwise
+        -- slip past a plain `playerSource or source` check).
         AddEventHandler('hospital:server:PlayerDied', function(playerSource)
-            emit(playerSource or source, 'player_death', {})
+            local resolvedSource = tonumber(playerSource) or source
+            if resolvedSource then emit(resolvedSource, 'player_death', {}) end
         end)
         -- Current QBox medical resource. It supplies the player through the
         -- server event context rather than as an explicit event parameter.
@@ -231,6 +344,7 @@ Adapters.qbox = {
     end,
     init = QBCoreAdapter.init,
     getPlayerInfo = QBCoreAdapter.getPlayerInfo,
+    getDeathJailState = QBCoreAdapter.getDeathJailState,
     registerEvents = QBCoreAdapter.registerEvents,
 }
 Adapters.qbcore = QBCoreAdapter
@@ -283,9 +397,21 @@ function Framework.GetPlayerInfo(source)
     return {}
 end
 
-function Framework.RegisterEvents(emit)
+-- Internal-only accessor used solely as the heartbeat backstop for the
+-- death-downtime/jail-time diff (see collector.lua's observeDeathJailField).
+-- ESX and vanilla have no adapter-level implementation, so this returns nil
+-- for them -- collector.lua treats that as "nothing to reconcile here" and
+-- relies entirely on the event-driven path instead.
+function Framework.GetDeathJailState(source)
+    if not active.getDeathJailState then return nil end
+    local ok, result = pcall(function() return active:getDeathJailState(source) end)
+    if ok then return result end
+    return nil
+end
+
+function Framework.RegisterEvents(emit, observe)
     if not Config.CollectFrameworkEvents then return end
-    local ok, err = pcall(function() active:registerEvents(emit) end)
+    local ok, err = pcall(function() active:registerEvents(emit, observe) end)
     if not ok then
         print(('[guildrate-collector] failed to register %s events: %s'):format(activeName, tostring(err)))
     end
