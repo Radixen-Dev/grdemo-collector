@@ -21,6 +21,13 @@
 -- accessor, never forwarded as-is, used to reconcile death-downtime/jail-time
 -- tracking on the heartbeat when the dedicated events below are missed. See
 -- README.md "Character depth: death downtime and jail time".
+--
+-- Vehicle trip tracking has no adapter here at all, deliberately: it is
+-- built entirely from vanilla FiveM natives in collector.lua and runs
+-- identically regardless of which adapter above is active. See README.md
+-- "Vehicle trip tracking" for why vehicle ownership/purchase/theft/impound
+-- -- the parts that would need a framework-specific hook -- are not
+-- collected.
 
 Framework = {}
 
