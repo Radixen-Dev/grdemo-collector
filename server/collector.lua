@@ -3,6 +3,7 @@
 
 local openSessions = {} -- [source] = { identifiers = {...}, joinedAt = os.time() }
 local emitEvent -- forward declaration: session-start callbacks flush queued events
+local endVehicleTrip -- forward declaration: playerDropped closes an open trip before the session is torn down
 local insecureUrlWarningLogged = false
 
 local function eventKey(source)
@@ -125,6 +126,16 @@ AddEventHandler('playerDropped', function(reason)
     local source = source
     local session = openSessions[source]
     if not session then return end
+
+    -- Close any open vehicle trip before the session disappears -- there is
+    -- no later poll that will ever observe this player again. Must run
+    -- before apiPost/openSessions[source] = nil below: endVehicleTrip calls
+    -- emitEvent, which requires the session to still be present in
+    -- openSessions. If sessionId never resolved, this queues into
+    -- pendingEvents and is lost along with the rest of that queue -- the
+    -- same accepted loss class as every other pendingEvents case in this
+    -- file, not a new one.
+    if session.vehicleTrip then endVehicleTrip(source, session, 'disconnected') end
 
     apiPost('/api/ingest/session/end', {
         sessionId = session.sessionId,
@@ -418,6 +429,20 @@ emitEvent = function(source, eventType, payload)
                 if type(payload[key]) == 'number' then safePayload[key] = payload[key] end
             end
             if payload.observedByHeartbeat == true then safePayload.observedByHeartbeat = true end
+        elseif eventType == 'vehicle_trip_started' or eventType == 'vehicle_trip_ended' then
+            -- tripId lets Analytics join a trip's start/end by an exact key
+            -- instead of positional/timestamp pairing -- both events for one
+            -- trip can land in the same delivery pass with the same
+            -- second-granularity occurred_at on a rapid vehicle switch. See
+            -- the "Vehicle trip tracking" section above.
+            safePayload.tripId = scrubText(payload.tripId, 64)
+            safePayload.plate = scrubText(payload.plate, 16)
+            safePayload.modelHash = type(payload.modelHash) == 'number' and payload.modelHash or nil
+            safePayload.vehicleClass = type(payload.vehicleClass) == 'number' and payload.vehicleClass or nil
+            if eventType == 'vehicle_trip_ended' then
+                safePayload.distanceMeters = type(payload.distanceMeters) == 'number' and payload.distanceMeters or nil
+                safePayload.endReason = scrubText(payload.endReason, 32)
+            end
         end
         safePayload.playerInfo = Framework.GetPlayerInfo(source)
     end
@@ -595,6 +620,204 @@ local function observeDeathJailField(source, field, rawValue)
 end
 
 -- ---------------------------------------------------------------------------
+-- Vehicle trip tracking
+-- ---------------------------------------------------------------------------
+-- Framework-agnostic: built entirely from vanilla FiveM natives, verified
+-- server-side-callable against citizenfx/fivem's own native-decls apiset
+-- metadata (GetVehiclePedIsIn, GetPedInVehicleSeat, GetVehicleNumberPlateText,
+-- GetEntityModel, GetEntitySpeed are all "apiset: server"; GetVehicleClass is
+-- the same read-only-vehicle-property category as GetVehicleNumberPlateText,
+-- which is). No framework adapter hook exists or is needed for this -- it
+-- runs identically on ESX, QBCore, QBox, and vanilla. See config.lua and
+-- README.md "Vehicle trip tracking" for why vehicle ownership, purchase,
+-- theft, and impound state are deliberately NOT collected here.
+--
+-- Poll-only design, the same shape as observeAfkTime/observeDeathJailField:
+-- there is no discrete "player entered/exited vehicle" event to miss, so
+-- there is no separate class of dedup bug from a missed exit signal -- a
+-- trip simply ends whenever the next poll finds the player no longer driving
+-- that vehicle, including "no longer connected" (playerDropped below).
+--
+-- Distance is accumulated as GetEntitySpeed(vehicle) * elapsed per sample (a
+-- right Riemann sum: each sample's speed is read at the *end* of the
+-- interval it is applied to, since that is the only point the poll actually
+-- observes), not a position-delta ("chord") measurement. Chord distance has
+-- a route-dependent bias that collapses towards zero on a loop (a circuit
+-- lap or a there-and-back drive would under-report to near nothing even
+-- though real distance was covered); integrating the vehicle's own reported
+-- speed avoids that bias entirely. The remaining error is ordinary sampling
+-- noise -- how much speed changes within one poll interval -- bounded by
+-- Config.VehicleTrackIntervalSec, not by the shape of the route. A trip's
+-- opening and closing partial intervals are covered too (see
+-- endVehicleTrip): without that, every trip would lose the fraction of a
+-- poll interval between the driver's real exit and the next poll noticing
+-- it, and any trip shorter than one full interval would report exactly zero
+-- distance every time -- both one-directional undercounts, the same failure
+-- shape as chord bias, just from the sampling window instead of the path.
+--
+-- Vehicle identity for "is this still the same trip" purposes is the game
+-- entity handle, not the plate: plates on ambient/non-player-owned vehicles
+-- are randomly generated by the game and are not a meaningful cross-session
+-- vehicle identity anyway. This is also why this feature reports driving
+-- activity (trip counts/distance by model), not a per-vehicle odometer --
+-- see docs/METRICS_ROADMAP.md "Vehicles" in grdemo-analytics. The plate is
+-- still carried in the payload for transparency/debugging.
+--
+-- Only the *driver* (seat -1) has an open trip -- passengers are not
+-- tracked. A player who is promoted/demoted between driver and passenger
+-- (or who switches vehicles entirely) mid-poll has their old trip closed and
+-- a new one opened (or nothing opened, if now a passenger) on the same pass.
+-- Both events land in the same HTTP delivery pass and can carry the same
+-- second-granularity occurred_at timestamp, so Analytics cannot reliably
+-- pair start/end by position or time alone on a rapid switch -- each trip
+-- carries its own tripId (a value opaque to the collector, unique per trip
+-- on this connection) on both its started and ended events specifically so
+-- Analytics can join on that instead. See docs/METRICS_ROADMAP.md
+-- "Vehicles" in grdemo-analytics for why this is exact-join, not
+-- positional/timestamp pairing, unlike player_jailed/player_released above.
+--
+-- Unlike observeDeathJailField's first-observation-only-seeds rule, a poll
+-- that first observes a player already driving (e.g. right after this
+-- resource restarts mid-drive) DOES emit vehicle_trip_started immediately,
+-- not just silently seed state. This is a deliberate difference, not an
+-- oversight: the death/jail rule exists to avoid *misreporting a false
+-- state-change claim* (a jailing declared to have started exactly at
+-- reconnect, when it really started earlier). There is no equivalent false
+-- claim here -- the trip simply starts measuring from the moment it was
+-- first observed, the same honest truncation every other resource-restart
+-- mid-session case in this file already accepts (e.g. observeMoneyChanges'
+-- first snapshot).
+
+-- Generous headroom over any real in-game ground vehicle's top speed, so a
+-- genuine sample is never dropped -- this exists only to stop a
+-- teleport/lag-spike-induced GetEntitySpeed misread (or a huge elapsed gap
+-- from a resource hitch) from being accumulated as real distance. Rejected
+-- samples drop that one sample's distance contribution; they never reset or
+-- end the trip, and never overwrite the trip's last known-good speed either
+-- (see accumulateTripDistance).
+local MAX_PLAUSIBLE_VEHICLE_SPEED_MPS = 150 -- ~540 km/h
+
+-- A misconfigured (e.g. 0 or negative) interval would otherwise turn this
+-- poll thread into a tight per-frame loop across every online player's
+-- vehicle state -- clamp at the point of use so a bad convar/config value
+-- degrades to "check every 5 seconds", never "check every tick".
+local function vehicleTrackIntervalSec()
+    return math.max(5, tonumber(Config.VehicleTrackIntervalSec) or 20)
+end
+
+local function currentDriverVehicle(source)
+    local okPed, ped = pcall(GetPlayerPed, source)
+    if not okPed or not ped or ped <= 0 then return nil end
+    local okVeh, vehicle = pcall(GetVehiclePedIsIn, ped, false)
+    if not okVeh or not vehicle or vehicle == 0 then return nil end
+    local okSeat, driver = pcall(GetPedInVehicleSeat, vehicle, -1)
+    if not okSeat or driver ~= ped then return nil end -- passenger, not driver
+    return vehicle
+end
+
+-- Accumulates one sample into trip.distanceMeters if, and only if, it passes
+-- the same plausibility guard used for both regular polls and the final
+-- partial-interval sample in endVehicleTrip -- one gate, two call sites,
+-- rather than two independently-maintained copies of the same bounds.
+-- Returns true when the sample was accepted (the caller uses this to decide
+-- whether to advance trip.lastSpeed -- a rejected sample must not become the
+-- new "last known good" extrapolation basis either).
+local function accumulateTripDistance(trip, speed, elapsedSec)
+    if type(speed) == 'number' and speed >= 0 and speed <= MAX_PLAUSIBLE_VEHICLE_SPEED_MPS
+        and elapsedSec > 0 and elapsedSec <= vehicleTrackIntervalSec() * 3 then
+        trip.distanceMeters = trip.distanceMeters + speed * elapsedSec
+        return true
+    end
+    return false
+end
+
+endVehicleTrip = function(source, session, reason)
+    local trip = session.vehicleTrip
+    if not trip then return end
+    session.vehicleTrip = nil
+
+    -- Final partial-interval sample: the real exit could have happened
+    -- anywhere between the last regular poll and this call, so extrapolate
+    -- using the last known-good speed reading rather than querying the
+    -- vehicle fresh -- by this point the player may already be out of the
+    -- seat (or, on disconnect, gone entirely), so a fresh read would no
+    -- longer reflect *their* driving. Without this, every trip would lose
+    -- this tail entirely and a trip shorter than one poll interval would
+    -- always report exactly zero distance (see the file header).
+    local nowMs = GetGameTimer()
+    local elapsedSec = (nowMs - trip.lastSampledAt) / 1000
+    accumulateTripDistance(trip, trip.lastSpeed, elapsedSec)
+
+    emitEvent(source, 'vehicle_trip_ended', {
+        tripId = trip.tripId,
+        plate = trip.plate,
+        modelHash = trip.modelHash,
+        vehicleClass = trip.vehicleClass,
+        distanceMeters = math.floor(trip.distanceMeters + 0.5),
+        endReason = reason,
+    })
+end
+
+local function startVehicleTrip(source, session, vehicle)
+    local okPlate, rawPlate = pcall(GetVehicleNumberPlateText, vehicle)
+    local plate = (okPlate and type(rawPlate) == 'string') and rawPlate:gsub('^%s+', ''):gsub('%s+$', '') or nil
+    if plate == '' then plate = nil end
+    local okModel, modelHash = pcall(GetEntityModel, vehicle)
+    local okClass, vehicleClass = pcall(GetVehicleClass, vehicle)
+    modelHash = (okModel and type(modelHash) == 'number') and modelHash or nil
+    vehicleClass = (okClass and type(vehicleClass) == 'number') and vehicleClass or nil
+    -- Sampled once at the moment the trip opens (not left at 0) so a trip
+    -- that closes before its first regular poll still has a real starting
+    -- speed to extrapolate its (sub-interval) duration from in
+    -- endVehicleTrip, instead of unconditionally reporting zero distance.
+    local okSpeed0, speed0 = pcall(GetEntitySpeed, vehicle)
+    local initialSpeed = (okSpeed0 and type(speed0) == 'number' and speed0 >= 0 and speed0 <= MAX_PLAUSIBLE_VEHICLE_SPEED_MPS)
+        and speed0 or 0
+    local tripId = eventKey(source)
+
+    session.vehicleTrip = {
+        entity = vehicle,
+        tripId = tripId,
+        plate = plate,
+        modelHash = modelHash,
+        vehicleClass = vehicleClass,
+        distanceMeters = 0,
+        lastSampledAt = GetGameTimer(),
+        lastSpeed = initialSpeed,
+    }
+    emitEvent(source, 'vehicle_trip_started', { tripId = tripId, plate = plate, modelHash = modelHash, vehicleClass = vehicleClass })
+end
+
+local function observeVehicleTrip(source, session)
+    local vehicle = currentDriverVehicle(source)
+    local trip = session.vehicleTrip
+
+    if not vehicle then
+        if trip then endVehicleTrip(source, session, 'exited') end
+        return
+    end
+
+    if trip and trip.entity ~= vehicle then
+        endVehicleTrip(source, session, 'exited')
+        trip = nil
+    end
+
+    if not trip then
+        startVehicleTrip(source, session, vehicle)
+        return
+    end
+
+    local nowMs = GetGameTimer()
+    local elapsedSec = (nowMs - trip.lastSampledAt) / 1000
+    trip.lastSampledAt = nowMs
+
+    local okSpeed, speed = pcall(GetEntitySpeed, vehicle)
+    if accumulateTripDistance(trip, okSpeed and speed or nil, elapsedSec) then
+        trip.lastSpeed = speed
+    end
+end
+
+-- ---------------------------------------------------------------------------
 -- AFK accounting
 -- ---------------------------------------------------------------------------
 
@@ -724,3 +947,25 @@ CreateThread(function()
         heartbeat()
     end
 end)
+
+-- Separate thread, separate interval from the heartbeat above: distance
+-- fidelity benefits from a tighter sampling interval than population/AFK
+-- reporting needs (see config.lua). Gated on Config.CollectVehicleTracking
+-- itself, not just on the emitEvent allowlist -- so disabling it also stops
+-- paying the per-tick native calls, not just their output.
+if Config.CollectVehicleTracking then
+    CreateThread(function()
+        while true do
+            Wait(vehicleTrackIntervalSec() * 1000)
+            -- Only players with an already-open session are polled; the
+            -- heartbeat thread above is what recovers/creates sessions for
+            -- newly-seen connections, so there is exactly one place that
+            -- happens rather than two racing to do it.
+            for _, playerSource in ipairs(GetPlayers()) do
+                local source = tonumber(playerSource)
+                local session = source and openSessions[source]
+                if session then observeVehicleTrip(source, session) end
+            end
+        end
+    end)
+end

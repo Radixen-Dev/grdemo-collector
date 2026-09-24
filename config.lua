@@ -34,6 +34,11 @@ Config.CollectFrameworkEvents = true
 -- QBCore/QBox emit:  player_death, player_respawned, player_jailed,
 --                    player_released, job_change, gang_change, money_change,
 --                    character_loaded, character_unloaded
+-- Any framework (or none): vehicle_trip_started, vehicle_trip_ended -- these
+--                    are not framework-sourced at all (see
+--                    Config.CollectVehicleTracking below); they are gated by
+--                    this same allowlist purely for consistency with every
+--                    other event type.
 --
 -- player_respawned is derived, not raw: it only reaches Analytics when it
 -- can be paired with a preceding player_death for the same session (an
@@ -56,6 +61,8 @@ Config.TrackedEvents = {
     'group_change',
     'character_loaded',
     'character_unloaded',
+    'vehicle_trip_started',
+    'vehicle_trip_ended',
 }
 
 -- Open Track API: caps how many exports('TrackEvent', ...) calls this
@@ -64,3 +71,32 @@ Config.TrackedEvents = {
 -- (e.g. a checkpoint fired every frame) from starving that load-bearing
 -- telemetry. See README.md "Track API" for the full contract.
 Config.TrackEventMaxPerMinute = 30
+
+-- Vehicle trip tracking: framework-agnostic, built entirely from vanilla
+-- FiveM natives (GetVehiclePedIsIn, GetPedInVehicleSeat,
+-- GetVehicleNumberPlateText, GetEntityModel, GetVehicleClass, GetEntitySpeed
+-- -- all verified server-side-callable against citizenfx/fivem's own
+-- native-decls apiset metadata). Works identically on ESX, QBCore, QBox, or
+-- no framework at all -- no adapter hook exists or is needed for it. Set to
+-- false to disable the poll thread entirely (not just its output).
+--
+-- Deliberately does NOT collect vehicle ownership, purchase, theft, or
+-- impound state: verified against current qb-core, qbx_core, and
+-- es_extended source that none of the three frameworks expose a reliable,
+-- core-owned signal for that (ownership/garage/shop state lives in addon
+-- resources -- qb-garages/qbx_vehicles, qb-vehicleshop/esx_vehicleshop --
+-- not in any core itself; even ESX's core vehicle class, the one partial
+-- exception, never exposes its own impound flag on the event it fires). See
+-- README.md "Vehicle trip tracking" and grdemo-analytics's
+-- docs/METRICS_ROADMAP.md "Vehicles" for the full citations.
+Config.CollectVehicleTracking = true
+
+-- Seconds between vehicle-occupancy/distance samples. Distance is
+-- accumulated as GetEntitySpeed(vehicle) * elapsed per sample (a right
+-- Riemann sum), not a position-delta -- so, unlike AFK's tolerance check,
+-- this interval does not create a route-shape bias, only ordinary sampling
+-- noise (how much a vehicle's speed changes within one interval). A
+-- shorter interval reduces that noise at the cost of one extra native call
+-- per online player per tick; 20s is a reasonable default for a feature
+-- whose headline numbers are trip/distance totals, not real-time telemetry.
+Config.VehicleTrackIntervalSec = 20
