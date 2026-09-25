@@ -6,6 +6,13 @@ local emitEvent -- forward declaration: session-start callbacks flush queued eve
 local endVehicleTrip -- forward declaration: playerDropped closes an open trip before the session is torn down
 local insecureUrlWarningLogged = false
 
+-- Reported to Analytics on every heartbeat so the dashboard can flag
+-- installs older than the server's configured minimum. Read once from
+-- fxmanifest.lua's own `version` field -- already bumped on every release,
+-- so there is nothing extra to keep in sync here.
+local COLLECTOR_VERSION = GetResourceMetadata(GetCurrentResourceName(), 'version', 0) or '0.0.0'
+local outdatedWarningLogged = false
+
 local function eventKey(source)
     return ('%s-%s-%s-%s'):format(os.time(), GetGameTimer(), source or 0, math.random(100000, 999999))
 end
@@ -925,7 +932,18 @@ local function heartbeat()
         maxPlayers = GetConvarInt('sv_maxclients', 0),
         framework = Framework.GetName(),
         players = players,
-    })
+        version = COLLECTOR_VERSION,
+    }, function(_, response)
+        local ok, decoded = pcall(json.decode, response)
+        if ok and decoded and decoded.outdated then
+            if not outdatedWarningLogged then
+                outdatedWarningLogged = true
+                print(('[guildrate-collector] this collector (v%s) is older than the dashboard requires -- data is still being collected, but some features may be degraded until you update. Download the latest release from GitHub.'):format(COLLECTOR_VERSION))
+            end
+        else
+            outdatedWarningLogged = false
+        end
+    end)
 end
 
 CreateThread(function()
